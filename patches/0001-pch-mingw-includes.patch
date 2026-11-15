@@ -1,0 +1,33 @@
+diff --git a/src/system/pch/pch.h b/src/system/pch/pch.h
+index 1c8ac7a..f6b1640 100644
+--- a/src/system/pch/pch.h
++++ b/src/system/pch/pch.h
+@@ -6,6 +6,13 @@
+ #define NOMINMAX
+ #define WIN32_LEAN_AND_MEAN
+ 
++// MSVC gets the full SDK include chain below. Under MinGW-w64 windows.h
++// already drags in winsock2, security.h and schannel.h, so defining
++// SECURITY_WIN32 before it (as this block does for MSVC) trips mingw's
++// "#error Do not use SECURITY_WIN32" guard in wincrypt.h. The schannel
++// declarations we need come from <schannel.h>, which pulls security.h in on
++// its own with the right flag set, so under MinGW that is what we include.
++#ifdef _MSC_VER
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
+ #include <windows.h>
+@@ -14,6 +21,14 @@
+ #define SECURITY_WIN32
+ #include <security.h>
+ #include <schannel.h>
++#else
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#include <windows.h>
++#include <shlobj.h>
++#include <shellapi.h>
++#include <schannel.h>
++#endif
+ 
+ // Minimal float constants for ImGui and custom no-CRT builds.
+ #ifndef FLT_MAX
