@@ -1,0 +1,8257 @@
+#include "pch.h"
+#include "rest.h"
+#include "store.h"
+#include "people.h"
+#include "archive.h"
+#include "captcha.h"
+#include "core/offline.h"
+#include "core/log.h"
+#include "core/crypto.h"
+#include "core/storage.h"
+#include "system/io/ufile.h"
+#include "net/json.h"
+#include "gateway.h"
+#include "science.h"
+
+namespace
+{
+    const char* API_BASE = "https://discord.com/api/v9";
+
+    char g_token[512];
+    char g_super_properties[1024];
+    char g_last_error[256];
+    char g_last_link[256];
+    char g_captcha_sitekey[128];
+    char g_captcha_rqtoken[256];
+    char g_captcha_session[64];
+    CRITICAL_SECTION g_err_lock;
+    bool g_ready = false;
+
+    // A form the worker parsed out of a type-9 interaction response, waiting
+    // for the interface to pick it up and show it.
+    CRITICAL_SECTION g_modal_lock;
+    bool g_modal_lock_ready = false;
+    api::modal_form g_pending_modal;
+    bool g_modal_ready = false;
+
+    // The channel a group operation just produced, for the interface to
+    // open. Jobs never touch the interface state directly; the picker that
+    // started the operation picks this up on its next frame and jumps.
+    CRITICAL_SECTION g_group_lock;
+    bool g_group_lock_ready = false;
+    snowflake g_group_result = 0;
+
+    // Nonces of component clicks this client sent, so a form arriving over
+    // the gateway can be matched to the click that asked for it. A modal for
+    // a click from another client (the same account in a browser) is not
+    // ours to open.
+    unsigned long long g_modal_nonce[8];
+    int g_modal_nonce_at = 0;
+
+    void note_modal_nonce(unsigned long long nonce)
+    {
+        g_modal_nonce[g_modal_nonce_at] = nonce;
+        g_modal_nonce_at = (g_modal_nonce_at + 1) % 8;
+    }
+
+    bool claim_modal_nonce(const char* nonce)
+    {
+        if (!nonce || !nonce[0]) return false;
+
+        for (int i = 0; i < 8; i++)
+        {
+            if (!g_modal_nonce[i]) continue;
+
+            char mine[32];
+            cnprint(mine, sizeof(mine), "%llu", g_modal_nonce[i]);
+            if (ccscmp(mine, nonce) == 0)
+            {
+                g_modal_nonce[i] = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    char g_launch_id[40];
+    char g_launch_signature[40];
+    char g_heartbeat_session[40];
+    char g_installation_id[96];
+
+    // Whether the token above belongs to a bot application.
+    bool g_token_is_bot = false;
+
+    // 8-4-4-4-12 hex, which is the shape these fields take. Random rather than
+    // derived from anything: they identify a run, not a machine.
+    void make_guid(char* out, int cap)
+    {
+        unsigned char b[16];
+        crypto::random_bytes(b, sizeof(b));
+
+        static const char* HEX = "0123456789abcdef";
+        int at = 0;
+
+        for (int i = 0; i < 16 && at < cap - 3; i++)
+        {
+            if (i == 4 || i == 6 || i == 8 || i == 10) out[at++] = '-';
+            out[at++] = HEX[b[i] >> 4];
+            out[at++] = HEX[b[i] & 0x0F];
+        }
+        out[at] = 0;
+    }
+
+    // Which installation this is, as the browser reports it: a snowflake, a
+    // dot, and an opaque tail. Unlike the three above it survives restarts -
+    // that is the whole of what it says, "the same install as last time" - so
+    // it is made once and kept beside the other settings.
+    //
+    // The browser sends it on every request. This client sent none, and one
+    // of the two gets asked for a CAPTCHA on an invite.
+    void build_installation_id()
+    {
+        const char* stored = storage::settings_get("installation_id", "");
+        if (stored && stored[0])
+        {
+            ccstrncpy(g_installation_id, stored, sizeof(g_installation_id) - 1);
+            return;
+        }
+
+        unsigned char raw[21];
+        crypto::random_bytes(raw, sizeof(raw));
+
+        ubuffer b64;
+        b64.init(64);
+        crypto::base64_encode(raw, sizeof(raw), &b64);
+
+        // Url-safe and unpadded, which is the alphabet the real one uses.
+        char tail[48];
+        int at = 0;
+        for (const char* q = b64.c_str(); *q && at < (int)sizeof(tail) - 1; q++)
+        {
+            char c = *q;
+            if (c == '=') continue;
+            if (c == '+') c = '-';
+            if (c == '/') c = '_';
+            tail[at++] = c;
+        }
+        tail[at] = 0;
+        b64.free_buffer();
+
+        // A snowflake is a moment in time; the low bits discord fills with
+        // worker and sequence numbers are left at zero rather than invented.
+        unsigned long long id = (unix_now_ms() - DISCORD_EPOCH_MS) << 22;
+
+        cnprint(g_installation_id, sizeof(g_installation_id), "%llu.%s", id, tail);
+        storage::settings_set("installation_id", g_installation_id);
+        storage::settings_save();
+    }
+
+    void build_super_properties()
+    {
+        make_guid(g_launch_id, sizeof(g_launch_id));
+        make_guid(g_launch_signature, sizeof(g_launch_signature));
+        make_guid(g_heartbeat_session, sizeof(g_heartbeat_session));
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("os", "Windows");
+        // Browser, version and user agent have to agree with each other. They
+        // did not: this said Chrome with a Chrome 120 agent while the number
+        // beside them described a build from years later. An inconsistent set
+        // is one of the things that gets a request answered with a captcha
+        // demand rather than a result.
+        w.kv_str("browser", "Firefox");
+        w.kv_str("device", "");
+        w.kv_str("system_locale", "en-US");
+        w.kv_bool("has_client_mods", false);
+        w.kv_str("browser_user_agent",
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) "
+                 "Gecko/20100101 Firefox/153.0");
+        w.kv_str("browser_version", "153.0");
+        w.kv_str("os_version", "10");
+        w.kv_str("referrer", "");
+        w.kv_str("referring_domain", "");
+        w.kv_str("referrer_current", "");
+        w.kv_str("referring_domain_current", "");
+        w.kv_str("release_channel", "stable");
+        w.kv_i64("client_build_number", DISCORD_BUILD_NUMBER);
+        w.kv_null("client_event_source");
+
+        // Four fields the real client always carries and this one never did.
+        // They identify one run of the application, so they are made once at
+        // startup and kept for its lifetime - a value that changed per request
+        // would describe a client restarting between every two of them.
+        w.kv_str("client_launch_id", g_launch_id);
+        w.kv_str("launch_signature", g_launch_signature);
+        w.kv_str("client_heartbeat_session_id", g_heartbeat_session);
+        w.kv_str("client_app_state", "focused");
+        w.end_obj();
+
+        ubuffer b64;
+        b64.init();
+        crypto::base64_encode(w.buf.data, w.buf.size, &b64);
+        ccstrncpy(g_super_properties, b64.c_str(), sizeof(g_super_properties) - 1);
+
+        b64.free_buffer();
+        w.free_writer();
+    }
+
+    // Where in the interface an action was taken. Discord requires it on the
+    // relationship endpoints and rejects the request without it - which is why
+    // adding, accepting and removing friends all failed while looking like
+    // ordinary requests on the wire.
+    //
+    // Base64 of a small json object, exactly as a capture of the real client
+    // shows: {"location":"Add Friend"} for adding by name, {"location":
+    // "Friends"} for everything done from the friends list.
+    void build_headers(ubuffer* out, const char* content_type, const char* location,
+                       const char* auth_override = 0)
+    {
+        out->clear();
+
+        // Normally whoever is signed in. The override exists for analytics
+        // about a call: a call outlives switching accounts, and its events
+        // have to be signed by the account actually sitting in the channel.
+        const char* auth = (auth_override && auth_override[0]) ? auth_override : g_token;
+
+        if (auth[0])
+        {
+            out->append_str("Authorization: ");
+            // Bot tokens are prefixed; a user token sent with the prefix is
+            // refused, and so is a bot token sent without it.
+            if (g_token_is_bot) out->append_str("Bot ");
+            out->append_str(auth);
+            out->append_str("\r\n");
+        }
+        if (content_type)
+        {
+            out->append_str("Content-Type: ");
+            out->append_str(content_type);
+            out->append_str("\r\n");
+        }
+
+        // Everything below this line describes a person at a browser: which
+        // build they run, where they clicked, what their locale is. A bot has
+        // none of it, and sending it anyway is not merely untrue - discord's
+        // edge refuses the request, which is what "internal network error" on
+        // every message and every history load turned out to be.
+        if (g_token_is_bot) return;
+        if (location && location[0])
+        {
+            // Either a bare place name, which is the common case, or a whole
+            // object already written by the caller. The invite join needs the
+            // second: discord wants the channel it is joining through named
+            // in there beside the location.
+            char json[288];
+            if (location[0] == '{') ccstrncpy(json, location, sizeof(json) - 1);
+            else cnprint(json, sizeof(json), "{\"location\":\"%s\"}", location);
+
+            ubuffer b64;
+            b64.init(sizeof(json) * 2);
+            crypto::base64_encode(json, (unsigned int)ccslenf(json), &b64);
+
+            out->append_str("X-Context-Properties: ");
+            out->append_str(b64.c_str());
+            out->append_str("\r\n");
+            b64.free_buffer();
+        }
+        out->append_str("X-Super-Properties: ");
+        out->append_str(g_super_properties);
+        out->append_str("\r\n");
+        if (g_installation_id[0])
+        {
+            out->append_str("X-Installation-ID: ");
+            out->append_str(g_installation_id);
+            out->append_str("\r\n");
+        }
+        out->append_str("X-Discord-Locale: en-US\r\n");
+        out->append_str("X-Discord-Timezone: Europe/Moscow\r\n");
+        out->append_str("X-Debug-Options: bugReporterEnabled\r\n");
+        out->append_str("Accept-Language: en-US,en;q=0.9\r\n");
+        out->append_str("Origin: https://discord.com\r\n");
+        out->append_str("Referer: https://discord.com/channels/@me\r\n");
+        out->append_str("Sec-Fetch-Dest: empty\r\n");
+        out->append_str("Sec-Fetch-Mode: cors\r\n");
+        out->append_str("Sec-Fetch-Site: same-origin\r\n");
+    }
+
+    // Pulls the human readable part out of a discord error body.
+    // "Invalid Form Body" is the whole of what the top of a 50035 says. Which
+    // field discord disliked, and why, sits one or more levels down under
+    // "errors", keyed by the field name, with the reason in an "_errors"
+    // array. Reporting only the top line leaves nothing to act on - it is the
+    // same sentence whether the code was mistyped or the account cannot be
+    // handed a server at all.
+    //
+    // Walks to the first "_errors" it finds and builds the dotted path on the
+    // way, so the report names the field.
+    bool first_form_error(const jval* node, char* path, int path_cap, const char** msg)
+    {
+        if (!node || node->type != JTYPE_OBJ) return false;
+
+        const jval* list = node->arr("_errors");
+        if (list->size())
+        {
+            const jval* first = list->at(0);
+            const char* m = first ? first->str("message", 0) : 0;
+            if (m) { *msg = m; return true; }
+        }
+
+        int used = 0;
+        while (path[used]) used++;
+
+        for (unsigned int i = 0; i < node->size(); i++)
+        {
+            const jmember* mem = node->member_at(i);
+            if (!mem || !mem->key || !mem->value) continue;
+
+            int at = used;
+            if (at && at < path_cap - 1) path[at++] = '.';
+            for (unsigned int k = 0; k < mem->key_len && at < path_cap - 1; k++)
+                path[at++] = mem->key[k];
+            path[at] = 0;
+
+            if (first_form_error(mem->value, path, path_cap, msg)) return true;
+
+            path[used] = 0;
+        }
+
+        return false;
+    }
+
+    void record_api_error(const char* what, http_response* res)
+    {
+        // Two answers mean more than the request that got them. Nothing at all
+        // says the network is gone; a 401 says the token is.
+        if (res->status == 0) offline::note_network_failure();
+        else if (res->status == 401) offline::note_token_rejected();
+
+        char text[256];
+        const char* detail = 0;
+
+        jdoc doc;
+        doc.init();
+        if (doc.parse(res->text(), (int)res->body.size))
+        {
+            detail = doc.root->str("message", 0);
+            if (!detail)
+            {
+                const char* errs = doc.root->obj("errors")->str("message", 0);
+                if (errs) detail = errs;
+            }
+
+            if (detail && (ccscmp(detail, "Die Ressourcenrate wird begrenzt.") == 0 ||
+                           ccscmp(detail, "You are being rate limited.") == 0))
+                detail = tr("Слишком много запросов, попробуй позже");
+        }
+
+        // Discord answers some refusals with a body that carries no message at
+        // all - a captcha demand is the common one, and it is what a friend
+        // request from an unfamiliar client tends to get. Reporting those as a
+        // bare status code hides the only useful thing in the response.
+        bool captcha = doc.root && (doc.root->has("captcha_key") ||
+                                    doc.root->has("captcha_sitekey") ||
+                                    doc.root->has("captcha_service"));
+
+        if (captcha)
+        {
+            cnprint(text, sizeof(text),
+                    tr("%s: discord требует пройти CAPTCHA - этот запрос надо "
+                    "сделать один раз в браузере или официальном клиенте"), what);
+        }
+        else if (detail)
+        {
+            char field[128];
+            field[0] = 0;
+
+            const char* deep = 0;
+            if (doc.root && first_form_error(doc.root->obj("errors"), field,
+                                             sizeof(field), &deep))
+                cnprint(text, sizeof(text), "%s: %s - %s: %s", what, detail, field, deep);
+            else
+                cnprint(text, sizeof(text), "%s: %s", what, detail);
+        }
+        else if (res->body.size)
+        {
+            // The raw answer, cut short. Better an unfamiliar json fragment
+            // than a number that says only that something was refused.
+            cnprint(text, sizeof(text), "%s: HTTP %d %.120s", what, res->status, res->text());
+        }
+        else
+        {
+            cnprint(text, sizeof(text), "%s: HTTP %d", what, res->status);
+        }
+
+        doc.free_doc();
+        api::set_last_error(text);
+        log_line("api: %s", text);
+    }
+}
+
+namespace
+{
+    // ---- onboarding and the rules gate -----------------------------------
+
+    ulist<api::onboard_prompt> g_prompts;
+    ulist<api::onboard_option> g_options;
+
+    ulist<char*> g_rules;          // one line each, owned here
+    char g_rules_desc[512];
+    char g_rules_version[64];
+
+    // The form exactly as it arrived. Agreeing means sending it back with an
+    // answer added to every field, and rebuilding it from parsed pieces would
+    // mean guessing at fields this client has never seen.
+    ubuffer g_rules_raw;
+    bool g_rules_raw_ready = false;
+
+    volatile long g_onboard_busy = 0;
+
+    // The server a join by invite landed in, until somebody asks for it.
+    volatile snowflake g_joined_guild = 0;
+
+    // A server whose panel ought to be shown, found by looking rather than by
+    // having just joined. Same idea: read once, then cleared.
+    volatile snowflake g_onboard_show = 0;
+
+    // Whether the last fetch found the panel already answered. A server keeps
+    // its prompts forever, so "has prompts" is not "wants an answer" - what
+    // separates them is whether this account has ever given one.
+    bool g_onboard_answered = false;
+
+    void free_rules()
+    {
+        for (unsigned int i = 0; i < g_rules.count; i++)
+            if (g_rules[i]) memfree(g_rules[i]);
+        g_rules.clear_fast();
+    }
+
+}
+
+void api::init()
+{
+    if (g_ready) return;
+    InitializeCriticalSection(&g_err_lock);
+    InitializeCriticalSection(&g_modal_lock);
+    g_modal_lock_ready = true;
+    InitializeCriticalSection(&g_group_lock);
+    g_group_lock_ready = true;
+    ccfset(g_token, 0, sizeof(g_token));
+    ccfset(g_last_error, 0, sizeof(g_last_error));
+    // The onboarding lists and the raw rules form live for the whole run, so
+    // they are set up once here rather than on first use from a worker thread.
+    g_prompts = ulist<api::onboard_prompt>();
+    g_options = ulist<api::onboard_option>();
+    g_rules = ulist<char*>();
+    g_rules_raw.init();
+
+    build_installation_id();
+    build_super_properties();
+    g_ready = true;
+}
+
+void api::shutdown()
+{
+    if (!g_ready) return;
+    ccfset(g_token, 0, sizeof(g_token));
+    DeleteCriticalSection(&g_group_lock);
+    g_group_lock_ready = false;
+    DeleteCriticalSection(&g_modal_lock);
+    g_modal_lock_ready = false;
+    DeleteCriticalSection(&g_err_lock);
+    g_ready = false;
+}
+
+void api::set_token(const char* t, bool bot)
+{
+    ccfset(g_token, 0, sizeof(g_token));
+    if (t) ccstrncpy(g_token, t, sizeof(g_token) - 1);
+
+    g_token_is_bot = bot;
+    http::set_bot_mode(bot);
+}
+
+const char* api::token() { return g_token; }
+bool api::has_token() { return g_token[0] != 0; }
+bool api::is_bot() { return g_token_is_bot; }
+
+void api::set_last_error(const char* text)
+{
+    if (!g_ready) return;
+    EnterCriticalSection(&g_err_lock);
+    ccfset(g_last_error, 0, sizeof(g_last_error));
+    if (text) ccstrncpy(g_last_error, text, sizeof(g_last_error) - 1);
+    LeaveCriticalSection(&g_err_lock);
+}
+
+const char* api::last_error() { return g_last_error; }
+void api::clear_last_error() { set_last_error(""); }
+
+// Guarded by the same lock as the error text, and for the same reason: it is
+// written on a job thread and read by the interface.
+void api::set_last_link(const char* url)
+{
+    if (!g_ready) return;
+    EnterCriticalSection(&g_err_lock);
+    ccfset(g_last_link, 0, sizeof(g_last_link));
+    if (url) ccstrncpy(g_last_link, url, sizeof(g_last_link) - 1);
+    LeaveCriticalSection(&g_err_lock);
+}
+
+const char* api::last_link() { return g_last_link; }
+void api::clear_last_link() { set_last_link(""); }
+
+bool api::call_absolute(const char* method, const char* url, const char* json_body,
+                        http_response* out, const char* location)
+{
+    ubuffer headers;
+    headers.init();
+    build_headers(&headers, json_body ? "application/json" : 0, location);
+
+    unsigned int body_len = json_body ? (unsigned int)ccslenf(json_body) : 0;
+    bool ok = http::request(method, url, headers.c_str(), json_body, body_len, out);
+    headers.free_buffer();
+
+    // A 429 asks us to back off; the caller decides whether to retry.
+    if (ok && out->status == 429)
+    {
+        jdoc doc;
+        doc.init();
+        if (doc.parse(out->text(), (int)out->body.size))
+            out->retry_after_ms = (int)(doc.root->dbl("retry_after", 1.0) * 1000.0);
+        doc.free_doc();
+        if (out->retry_after_ms <= 0) out->retry_after_ms = 1000;
+    }
+    return ok;
+}
+
+bool api::call(const char* method, const char* path, const char* json_body,
+               http_response* out, const char* location)
+{
+    char url[2048];
+    cnprint(url, sizeof(url), "%s%s", API_BASE, path);
+    if (out->status) offline::note_network_success();
+    return call_absolute(method, url, json_body, out, location);
+}
+
+bool api::call_as(const char* method, const char* path, const char* json_body,
+                  http_response* out, const char* auth_token)
+{
+    char url[2048];
+    cnprint(url, sizeof(url), "%s%s", API_BASE, path);
+
+    ubuffer headers;
+    headers.init();
+    build_headers(&headers, json_body ? "application/json" : 0, 0, auth_token);
+
+    unsigned int body_len = json_body ? (unsigned int)ccslenf(json_body) : 0;
+    bool ok = http::request(method, url, headers.c_str(), json_body, body_len, out);
+    headers.free_buffer();
+    return ok;
+}
+
+bool api::verify_token(const char* token_value, bool is_bot, char* out_error, int error_cap)
+{
+    char saved[512];
+    ccstrncpy(saved, g_token, sizeof(saved) - 1);
+    saved[sizeof(saved) - 1] = 0;
+
+    bool saved_bot = g_token_is_bot;
+    set_token(token_value, is_bot);
+
+    http_response res;
+    res.init();
+    bool ok = false;
+
+    if (!call("GET", "/users/@me", 0, &res))
+    {
+        cnprint(out_error, error_cap, tr("Нет соединения с discord.com"));
+    }
+    else if (res.status == 401)
+    {
+        cnprint(out_error, error_cap, tr("Токен отклонён (401)"));
+    }
+    else if (!res.ok())
+    {
+        cnprint(out_error, error_cap, tr("Ошибка HTTP %d"), res.status);
+    }
+    else
+    {
+        jdoc doc;
+        doc.init();
+        if (doc.parse(res.text(), (int)res.body.size) && doc.root->sf("id"))
+        {
+            store::guard g;
+            duser* me = store::upsert_user(doc.root);
+            if (me) store::set_self_id(me->id);
+            ok = true;
+            out_error[0] = 0;
+        }
+        else
+        {
+            cnprint(out_error, error_cap, tr("Неожиданный ответ сервера"));
+        }
+        doc.free_doc();
+    }
+
+    res.free_response();
+    if (!ok) set_token(saved, saved_bot);
+    ccfset(saved, 0, sizeof(saved));
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// async jobs
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    struct job_ids
+    {
+        snowflake a;
+        snowflake b;
+    };
+
+    struct job_text
+    {
+        snowflake channel_id;
+        snowflake reply_to;
+        char text[4096];
+    };
+
+    struct job_upload
+    {
+        snowflake channel_id;
+        char text[2048];
+        ulist<upload_file> files;
+    };
+
+    struct job_name
+    {
+        char text[128];
+
+        // What was typed before it was cut down to a code. Only the invite
+        // join uses it: discord wants the whole link reported beside the
+        // code, and the two are not the same string.
+        char full[192];
+    };
+
+    struct job_friend
+    {
+        char name[128];
+        char captcha_key[2048];      // hcaptcha tokens are long
+        char captcha_rqtoken[256];
+        char note[256];              // attached to the request, may be empty
+    };
+
+    struct job_after
+    {
+        snowflake channel;
+        snowflake after;
+        snowflake until;
+        int budget;   // max messages this pass pulls, <=0 runs to the far side
+    };
+
+    // ---- what has been asked about a boundary -----------------------------
+
+    struct gap_note
+    {
+        snowflake channel;
+        snowflake after;
+        int state;
+    };
+
+    const int MAX_GAP_NOTES = 256;
+
+    gap_note g_gap_notes[MAX_GAP_NOTES];
+    int g_gap_note_count = 0;
+    volatile long g_gap_checks = 0;
+    CRITICAL_SECTION g_gap_lock;
+    bool g_gap_ready = false;
+
+    // One hole fill at a time per channel (history_loading guards that), so
+    // one slot is enough for its progress: what the marker shows while the
+    // pages arrive. Written by the worker, read by the interface.
+    volatile long g_fill_active = 0;
+    snowflake g_fill_channel = 0;
+    volatile long g_fill_fetched = 0;
+    volatile long g_fill_wanted = 0;
+
+    void gap_lock_ready()
+    {
+        if (g_gap_ready) return;
+
+        InitializeCriticalSection(&g_gap_lock);
+        g_gap_ready = true;
+    }
+
+    gap_note* gap_find(snowflake channel, snowflake after)
+    {
+        for (int i = 0; i < g_gap_note_count; i++)
+            if (g_gap_notes[i].channel == channel && g_gap_notes[i].after == after)
+                return &g_gap_notes[i];
+
+        return 0;
+    }
+
+    void gap_set(snowflake channel, snowflake after, int state)
+    {
+        gap_note* n = gap_find(channel, after);
+
+        if (!n)
+        {
+            if (g_gap_note_count >= MAX_GAP_NOTES) g_gap_note_count = 0;
+            n = &g_gap_notes[g_gap_note_count++];
+            n->channel = channel;
+            n->after = after;
+        }
+
+        n->state = state;
+    }
+
+    void job_check_gap(void* user)
+    {
+        job_after* j = (job_after*)user;
+
+        char path[256];
+        cnprint(path, sizeof(path), "/channels/%llu/messages?limit=1&after=%llu",
+                j->channel, j->after);
+
+        http_response res;
+        res.init();
+
+        int verdict = api::GAP_UNKNOWN;
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                if (doc.root->count == 0)
+                {
+                    // Nothing at all after it. Whatever we hold on the far
+                    // side was deleted since, and there is no hole to fill.
+                    verdict = api::GAP_NONE;
+                }
+                else
+                {
+                    snowflake next = doc.root->at(0)->sf("id");
+
+                    // The very next message is the one already held: they are
+                    // neighbours and this boundary is settled for good.
+                    verdict = (next >= j->until) ? api::GAP_NONE : api::GAP_REAL;
+                }
+            }
+
+            doc.free_doc();
+        }
+
+        if (verdict == api::GAP_NONE)
+            archive::note_range(j->channel, j->after, j->until);
+
+        EnterCriticalSection(&g_gap_lock);
+        gap_set(j->channel, j->after, verdict);
+        LeaveCriticalSection(&g_gap_lock);
+
+        InterlockedDecrement(&g_gap_checks);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_after(void* user)
+    {
+        job_after* j = (job_after*)user;
+
+        // Discord hands over at most a hundred per request, so a hole of
+        // thousands is walked page by page: after=cursor, newest first
+        // within each page, the cursor advancing to what just arrived.
+        const int PAGE = 100;
+
+        // Unbounded ("to the far side") still ends somewhere: past this many
+        // messages the hole is either bottomless or the account is being
+        // throttled, and either way the marker stays for another pass.
+        const int HARD_CAP = 10000;
+
+        int remaining = (j->budget > 0) ? j->budget : HARD_CAP;
+
+        // A breath between pages. Fifty back-to-back requests are exactly
+        // what earns a 429 that then applies to everything else too.
+        const unsigned int BETWEEN_PAGES_MS = 200;
+
+        InterlockedExchange(&g_fill_fetched, 0);
+        InterlockedExchange(&g_fill_wanted, (j->budget > 0) ? j->budget : 0);
+        g_fill_channel = j->channel;
+        InterlockedExchange(&g_fill_active, 1);
+
+        snowflake cursor = j->after;
+        snowflake newest = 0;
+        int fetched = 0;
+        int idle429 = 0;
+        bool reached = false;
+        bool failed = false;
+
+        while (remaining > 0 && !reached && !failed)
+        {
+            int want = remaining < PAGE ? remaining : PAGE;
+
+            char path[256];
+            cnprint(path, sizeof(path), "/channels/%llu/messages?limit=%d&after=%llu",
+                    j->channel, want, cursor);
+
+            http_response res;
+            res.init();
+
+            bool ok = api::call("GET", path, 0, &res);
+
+            if (ok && res.status == 429)
+            {
+                int wait = res.retry_after_ms > 0 ? res.retry_after_ms : 1000;
+                res.free_response();
+
+                // Told to slow down: wait it out and ask for the same page
+                // again, a few times. Past that something is wrong and
+                // hammering on only makes it worse.
+                if (++idle429 > 5) { failed = true; break; }
+                Sleep((DWORD)(wait + 200));
+                continue;
+            }
+
+            if (!ok || !res.ok())
+            {
+                if (!ok || res.status != 429)
+                    record_api_error(tr("Не удалось загрузить историю"), &res);
+                res.free_response();
+                failed = true;
+                break;
+            }
+
+            idle429 = 0;
+
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                          doc.root->type == JTYPE_ARR;
+            unsigned int count = parsed ? doc.root->count : 0;
+
+            if (parsed && count)
+            {
+                snowflake page_newest = 0;
+
+                {
+                    store::guard g;
+                    for (unsigned int i = 0; i < count; i++)
+                    {
+                        dmessage* m = store::upsert_message(doc.root->at(i));
+                        if (!m) continue;
+                        if (!newest || m->id < newest) newest = m->id;
+                        if (m->id > page_newest) page_newest = m->id;
+                    }
+                    store::bump_revision();
+                }
+
+                for (unsigned int i = 0; i < count; i++)
+                    archive::put_json(doc.root->at(i));
+
+                fetched += (int)count;
+                remaining -= (int)count;
+                cursor = page_newest;
+                InterlockedExchange(&g_fill_fetched, fetched);
+
+                // The far side showed up inside this page: the hole is shut.
+                if (j->until && page_newest >= j->until) reached = true;
+                // A short page means the server has nothing more after the
+                // cursor - whatever the far side held past that is gone.
+                else if ((int)count < want) reached = true;
+            }
+            else if (parsed)
+            {
+                // Nothing at all after the cursor: a hole over a stretch
+                // nobody wrote in, or a far side that has since been deleted.
+                reached = true;
+            }
+            else
+            {
+                failed = true;
+            }
+
+            doc.free_doc();
+            res.free_response();
+
+            if (!reached && !failed && remaining > 0) Sleep(BETWEEN_PAGES_MS);
+        }
+
+        // The run has to include the message it started from, or the
+        // stretch it closes is still recorded as two separate ones and
+        // the hole is drawn again over nothing.
+        snowflake from = j->after;
+        snowflake to = newest;
+
+        // Fewer than a page means there was nothing else after the
+        // starting point, so the far side of the hole is reached too -
+        // even when it produced no messages of its own, which is what
+        // a hole over a quiet week looks like.
+        if (reached && j->until > to) to = j->until;
+
+        if (to > from) archive::note_range(j->channel, from, to);
+        else if (!fetched && j->until > from) archive::note_range(j->channel, from, j->until);
+
+        InterlockedExchange(&g_fill_active, 0);
+        g_fill_channel = 0;
+
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->channel);
+            if (ch) ch->history_loading = false;
+        }
+
+        memfree(j);
+    }
+
+    struct job_gap_back
+    {
+        snowflake channel;
+        snowflake before;   // hole's far side: first page ends here, going down
+        snowflake stop;     // hole's near side: reaching it shuts the hole
+        int budget;
+    };
+
+    // The mirror of job_fetch_after: walks the hole backwards, page by page
+    // older than the cursor, until the near side shows up, the budget runs
+    // out, or the server runs dry. Same guards, same progress slot: one
+    // fill per channel at a time either way.
+    void job_fetch_gap_before(void* user)
+    {
+        job_gap_back* j = (job_gap_back*)user;
+
+        const int PAGE = 100;
+        const int HARD_CAP = 10000;
+        const unsigned int BETWEEN_PAGES_MS = 200;
+
+        int remaining = (j->budget > 0) ? j->budget : HARD_CAP;
+
+        InterlockedExchange(&g_fill_fetched, 0);
+        InterlockedExchange(&g_fill_wanted, (j->budget > 0) ? j->budget : 0);
+        g_fill_channel = j->channel;
+        InterlockedExchange(&g_fill_active, 1);
+
+        snowflake cursor = j->before;
+        snowflake oldest = 0;
+        int fetched = 0;
+        int idle429 = 0;
+        bool reached = false;
+        bool failed = false;
+
+        while (remaining > 0 && !reached && !failed)
+        {
+            int want = remaining < PAGE ? remaining : PAGE;
+
+            char path[256];
+            cnprint(path, sizeof(path), "/channels/%llu/messages?limit=%d&before=%llu",
+                    j->channel, want, cursor);
+
+            http_response res;
+            res.init();
+
+            bool ok = api::call("GET", path, 0, &res);
+
+            if (ok && res.status == 429)
+            {
+                int wait = res.retry_after_ms > 0 ? res.retry_after_ms : 1000;
+                res.free_response();
+
+                if (++idle429 > 5) { failed = true; break; }
+                Sleep((DWORD)(wait + 200));
+                continue;
+            }
+
+            if (!ok || !res.ok())
+            {
+                if (!ok || res.status != 429)
+                    record_api_error(tr("Не удалось загрузить историю"), &res);
+                res.free_response();
+                failed = true;
+                break;
+            }
+
+            idle429 = 0;
+
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                          doc.root->type == JTYPE_ARR;
+            unsigned int count = parsed ? doc.root->count : 0;
+
+            if (parsed && count)
+            {
+                snowflake page_oldest = 0;
+
+                {
+                    store::guard g;
+                    for (unsigned int i = 0; i < count; i++)
+                    {
+                        dmessage* m = store::upsert_message(doc.root->at(i));
+                        if (!m) continue;
+                        if (!oldest || m->id < oldest) oldest = m->id;
+                        if (!page_oldest || m->id < page_oldest) page_oldest = m->id;
+                    }
+                    store::bump_revision();
+                }
+
+                for (unsigned int i = 0; i < count; i++)
+                    archive::put_json(doc.root->at(i));
+
+                fetched += (int)count;
+                remaining -= (int)count;
+                cursor = page_oldest;
+                InterlockedExchange(&g_fill_fetched, fetched);
+
+                // The near side showed up inside this page: the hole is shut.
+                if (j->stop && page_oldest <= j->stop) reached = true;
+                // A short page means the server has nothing older past the
+                // cursor - whatever sat between is gone with it.
+                else if ((int)count < want) reached = true;
+            }
+            else if (parsed)
+            {
+                reached = true;
+            }
+            else
+            {
+                failed = true;
+            }
+
+            doc.free_doc();
+            res.free_response();
+
+            if (!reached && !failed && remaining > 0) Sleep(BETWEEN_PAGES_MS);
+        }
+
+        // Mirror image of the forward fill: the filled run is what sits
+        // between the oldest arrival and the side the walk started from.
+        snowflake from = oldest;
+        snowflake to = j->before;
+
+        if (reached && j->stop > from) from = j->stop;
+
+        if (to > from) archive::note_range(j->channel, from, to);
+        else if (!fetched && j->stop && j->before > j->stop)
+            archive::note_range(j->channel, j->stop, j->before);
+
+        InterlockedExchange(&g_fill_active, 0);
+        g_fill_channel = 0;
+
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->channel);
+            if (ch) ch->history_loading = false;
+        }
+
+        memfree(j);
+    }
+
+    void job_fetch_messages(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[256];
+        if (j->b)
+            cnprint(path, sizeof(path), "/channels/%llu/messages?limit=50&before=%llu", j->a, j->b);
+        else
+            cnprint(path, sizeof(path), "/channels/%llu/messages?limit=50", j->a);
+
+        http_response res;
+        res.init();
+
+        // Cleared whatever happens below. It used to be cleared on the two
+        // paths somebody thought of - a good answer and a failed request - and
+        // a two hundred with a body that would not parse as an array left it
+        // set for good. After that the channel refused to load anything ever
+        // again, silently, because every later call returns at the guard that
+        // reads this flag.
+        bool answered = false;
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                answered = true;
+                snowflake oldest = 0, newest = 0;
+
+                {
+                    store::guard g;
+                    for (unsigned int i = 0; i < doc.root->count; i++)
+                    {
+                        dmessage* m = store::upsert_message(doc.root->at(i));
+                        if (!m) continue;
+                        if (!oldest || m->id < oldest) oldest = m->id;
+                        if (m->id > newest) newest = m->id;
+                    }
+
+                    dchannel* ch = store::find_channel(j->a);
+                    if (ch)
+                    {
+                        ch->history_loading = false;
+                        ch->history_loaded = true;
+                        ch->history_failed = false;
+                        if (doc.root->count < 50) ch->history_exhausted = true;
+                    }
+                    store::bump_revision();
+                }
+
+                // Everything discord hands over is kept, and the stretch it
+                // covers is written down: an export can then tell a quiet
+                // evening from a hole where nothing was ever fetched.
+                for (unsigned int i = 0; i < doc.root->count; i++)
+                    archive::put_json(doc.root->at(i));
+
+                if (oldest && newest) archive::note_range(j->a, oldest, newest);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось загрузить историю"), &res);
+            store::guard g;
+            dchannel* ch = store::find_channel(j->a);
+            if (ch)
+            {
+                ch->history_loading = false;
+                ch->history_failed = true;
+            }
+        }
+
+        if (!answered)
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->a);
+            if (ch && ch->history_loading)
+            {
+                ch->history_loading = false;
+                log_line("history: канал %llu - ответ не разобрался, снимаю замок", j->a);
+            }
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_sessions(void* user)
+    {
+        http_response res;
+        res.init();
+
+        bool ok = false;
+        if (api::call("GET", "/auth/sessions", 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_OBJ)
+            {
+                store::guard g;
+                store::set_sessions(doc.root->arr("user_sessions"));
+                ok = true;
+            }
+            doc.free_doc();
+        }
+
+        if (!ok)
+        {
+            store::guard g;
+            store::set_sessions_failed();
+        }
+
+        res.free_response();
+    }
+
+    // Captcha-aware request helpers, defined further below beside the
+    // friend request that grew them. Declared here so the message jobs
+    // above can already retry through the browser harness.
+    bool solve_response_captcha(http_response* res, const char* action,
+                                captcha::challenge* ch, char* token_out, int token_cap,
+                                bool stash = true);
+    void build_captcha_extra(const captcha::challenge* ch, const char* token,
+                             char* extra, int extra_cap);
+    bool call_captcha_aware(const char* method, const char* path, const char* json_body,
+                            http_response* res, const char* location, const char* action,
+                            captcha::challenge* solved, bool stash = true);
+
+    void job_send_message(void* user)
+    {
+        job_text* j = (job_text*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("content", j->text);
+        w.kv_i64("flags", 0);
+        // A random nonce lets discord de-duplicate resends.
+        unsigned long long nonce = 0;
+        crypto::random_bytes(&nonce, sizeof(nonce));
+        w.kv_snowflake("nonce", nonce >> 4);
+        if (j->reply_to)
+        {
+            w.key("message_reference");
+            w.begin_obj();
+            w.kv_snowflake("message_id", j->reply_to);
+            w.kv_snowflake("channel_id", j->channel_id);
+            w.end_obj();
+        }
+        w.end_obj();
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/messages", j->channel_id);
+
+        // The first message to a stranger is the one discord answers with a
+        // captcha demand. The nonce below de-duplicates the retry, so solving
+        // it cannot post twice.
+        http_response res;
+        res.init();
+
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+
+        bool sent = call_captcha_aware("POST", path, w.c_str(), &res, 0,
+                                       tr("Отправка сообщения"), &solved, false);
+        if (sent)
+        {
+            if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
+
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                store::upsert_message(doc.root);
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Сообщение не отправлено"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_send_upload(void* user)
+    {
+        job_upload* j = (job_upload*)user;
+
+        char boundary[64];
+        unsigned char rnd[16];
+        crypto::random_bytes(rnd, sizeof(rnd));
+        cnprint(boundary, sizeof(boundary), "----IMDiscord%llx%llx",
+                *(unsigned long long*)rnd, *(unsigned long long*)(rnd + 8));
+
+        jwriter payload;
+        payload.init();
+        payload.begin_obj();
+        payload.kv_str("content", j->text);
+        payload.key("attachments");
+        payload.begin_arr();
+        for (unsigned int i = 0; i < j->files.count; i++)
+        {
+            payload.begin_obj();
+            payload.kv_i64("id", (long long)i);
+            payload.kv_str("filename", j->files[i].name);
+            payload.end_obj();
+        }
+        payload.end_arr();
+        payload.end_obj();
+
+        ubuffer body;
+        body.init(1 << 20);
+
+        body.append_fmt("--%s\r\n", boundary);
+        body.append_str("Content-Disposition: form-data; name=\"payload_json\"\r\n");
+        body.append_str("Content-Type: application/json\r\n\r\n");
+        body.append(payload.buf.data, payload.buf.size);
+        body.append_str("\r\n");
+
+        for (unsigned int i = 0; i < j->files.count; i++)
+        {
+            upload_file* f = &j->files[i];
+            body.append_fmt("--%s\r\n", boundary);
+            body.append_fmt("Content-Disposition: form-data; name=\"files[%u]\"; filename=\"%s\"\r\n", i, f->name);
+            body.append_fmt("Content-Type: %s\r\n\r\n", f->content_type[0] ? f->content_type : "application/octet-stream");
+            body.append(f->data, f->size);
+            body.append_str("\r\n");
+        }
+        body.append_fmt("--%s--\r\n", boundary);
+
+        char content_type[128];
+        cnprint(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+
+        ubuffer headers;
+        headers.init();
+        build_headers(&headers, content_type, 0);
+
+        char url[256];
+        cnprint(url, sizeof(url), "%s/channels/%llu/messages", API_BASE, j->channel_id);
+
+        http_response res;
+        res.init();
+        // Files go up inside one multipart body, and a 400 on it is most
+        // often the stranger-tax captcha: the first message to someone new.
+        // The body is already built, so only the headers grow for the retry.
+        bool sent = http::request("POST", url, headers.c_str(), body.data, body.size, &res) &&
+                      res.ok();
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+        if (!sent)
+        {
+            char token[4096];
+            token[0] = 0;
+            if (solve_response_captcha(&res, tr("Отправка файла"), &solved,
+                                       token, sizeof(token), false))
+            {
+                char extra[4608];
+                build_captcha_extra(&solved, token, extra, sizeof(extra));
+                headers.append_str(extra);
+                ccfset(extra, 0, sizeof(extra));
+
+                res.free_response();
+                res.init();
+                sent = http::request("POST", url, headers.c_str(), body.data, body.size,
+                                      &res) && res.ok();
+                ccfset(token, 0, sizeof(token));
+            }
+        }
+        if (sent)
+        {
+            if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
+
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                store::upsert_message(doc.root);
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Файл не отправлен"), &res);
+        }
+
+        res.free_response();
+        headers.free_buffer();
+        body.free_buffer();
+        payload.free_writer();
+
+        for (unsigned int i = 0; i < j->files.count; i++)
+            if (j->files[i].data) memfree(j->files[i].data);
+        j->files.dispose();
+        memfree(j);
+    }
+
+    void job_fetch_profile(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        // Both lists asked for. They are the two things a profile knows that
+        // nothing else does, and they are what the servers-in-common and
+        // friends-in-common sections are built out of - here and, once they are
+        // written down, on every other account and with no connection at all.
+        char path[256];
+        if (j->b)
+            cnprint(path, sizeof(path),
+                    "/users/%llu/profile?with_mutual_guilds=true&with_mutual_friends=true"
+                    "&with_mutual_friends_count=true&guild_id=%llu", j->a, j->b);
+        else
+            cnprint(path, sizeof(path),
+                    "/users/%llu/profile?with_mutual_guilds=true&with_mutual_friends=true"
+                    "&with_mutual_friends_count=true", j->a);
+
+        http_response res;
+        res.init();
+        bool ok = api::call("GET", path, 0, &res) && res.ok();
+
+        if (!ok)
+        {
+            // Profile endpoint is restricted for bot tokens; fall back.
+            res.free_response();
+            res.init();
+            cnprint(path, sizeof(path), "/users/%llu", j->a);
+            ok = api::call("GET", path, 0, &res) && res.ok();
+        }
+
+        if (ok)
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                const jval* uobj = doc.root->has("user") ? doc.root->obj("user") : doc.root;
+                duser* u = store::upsert_user(uobj);
+                if (u)
+                {
+                    u->profile_loaded = true;
+                    const char* bio = doc.root->str("bio", uobj->str("bio", 0));
+                    if (bio) u->bio = store::intern(bio);
+                    people::note_user(u);
+                }
+
+                // Servers in common, as this account sees them. Written down
+                // rather than only shown: another account of ours shares a
+                // different set, and together they say more than either.
+                const jval* mg = doc.root->arr("mutual_guilds");
+                for (unsigned int i = 0; i < mg->count; i++)
+                {
+                    snowflake gid = mg->at(i)->sf("id");
+                    if (gid) people::note_member(gid, j->a);
+                }
+
+                // Friends in common. The whole list at once, because what makes
+                // it worth keeping is the comparison with last time - somebody
+                // missing from it now was unfriended since, and no single answer
+                // from discord ever says that.
+                const jval* mf = doc.root->arr("mutual_friends");
+                if (mf->type == JTYPE_ARR)
+                {
+                    ulist<snowflake> ids;
+                    for (unsigned int i = 0; i < mf->count; i++)
+                    {
+                        const jval* f = mf->at(i);
+                        duser* fu = store::upsert_user(f);
+                        if (fu) people::note_user(fu);
+
+                        snowflake fid = f->sf("id");
+                        if (fid) ids.push(fid);
+                    }
+
+                    people::note_mutual_friends(j->a, ids.count ? &ids[0] : 0, (int)ids.count);
+                    ids.dispose();
+                }
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Профиль недоступен"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_guild_channels(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/channels", j->a);
+
+        http_response res;
+        res.init();
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                store::guard g;
+                dguild* guild = store::find_guild(j->a);
+                if (guild)
+                {
+                    guild->channels.clear_fast();
+                    for (unsigned int i = 0; i < doc.root->count; i++)
+                    {
+                        dchannel* c = store::upsert_channel(doc.root->at(i), j->a);
+                        if (c) guild->channels.push(c->id);
+                    }
+                    guild->loaded = true;
+                }
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Каналы сервера недоступны"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_channel(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[64];
+        cnprint(path, sizeof(path), "/channels/%llu", j->a);
+
+        http_response res;
+        res.init();
+
+        // Quietly: this is asked for on the strength of a message arriving in a
+        // channel nothing had described yet, and a refusal is not something
+        // anybody did wrong.
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                store::upsert_channel(doc.root, doc.root->sf("guild_id"));
+                store::touch_dm_order();
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_guild_member(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/members/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                dguild* guild = store::find_guild(j->a);
+                store::add_guild_member(guild, doc.root);
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            log_line("rest: member %llu of guild %llu not fetched (http %d)",
+                     j->b, j->a, res.status);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_open_dm(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.key("recipients");
+        w.begin_arr();
+        char id[32];
+        cnprint(id, sizeof(id), "%llu", j->a);
+        w.val_str(id);
+        w.end_arr();
+        w.end_obj();
+
+        http_response res;
+        res.init();
+        if (api::call("POST", "/users/@me/channels", w.c_str(), &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                store::upsert_channel(doc.root, 0);
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось открыть личные сообщения"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    // The channel a group operation just produced, for the interface to open.
+    // Jobs never touch the interface state directly; the picker that started
+    // the operation picks this up on its next frame and jumps.
+    void stash_group_result(snowflake channel_id)
+    {
+        EnterCriticalSection(&g_group_lock);
+        g_group_result = channel_id;
+        LeaveCriticalSection(&g_group_lock);
+    }
+
+    struct group_add_args
+    {
+        snowflake channel;
+        snowflake members[10];
+        int count;
+    };
+
+    // One member per request, in order: adding to a 1-1 conversation turns
+    // it into a group, and the answer carries the new channel id, which the
+    // next request goes to.
+    void job_group_add(void* user)
+    {
+        group_add_args* j = (group_add_args*)user;
+        snowflake current = j->channel;
+
+        for (int i = 0; i < j->count; i++)
+        {
+            char path[160];
+            cnprint(path, sizeof(path), "/channels/%llu/recipients/%llu", current, j->members[i]);
+
+            http_response res;
+            res.init();
+            bool ok = api::call("PUT", path, 0, &res) && res.ok();
+
+            if (ok)
+            {
+                jdoc doc;
+                doc.init();
+                if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                {
+                    store::guard g;
+                    dchannel* c = store::upsert_channel(doc.root, 0);
+                    if (c) current = c->id;
+                    store::bump_revision();
+                }
+                doc.free_doc();
+            }
+
+            log_line("group: +%llu в %llu -> %d", j->members[i], current, res.status);
+
+            if (!ok)
+            {
+                record_api_error(tr("Не удалось добавить в группу"), &res);
+                res.free_response();
+                memfree(j);
+                return;
+            }
+
+            res.free_response();
+        }
+
+        stash_group_result(current);
+        memfree(j);
+    }
+
+    void job_group_create(void* user)
+    {
+        group_add_args* j = (group_add_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.key("recipients");
+        w.begin_arr();
+        for (int i = 0; i < j->count; i++)
+        {
+            char id[32];
+            cnprint(id, sizeof(id), "%llu", j->members[i]);
+            w.val_str(id);
+        }
+        w.end_arr();
+        w.end_obj();
+
+        http_response res;
+        res.init();
+        bool ok = api::call("POST", "/users/@me/channels", w.c_str(), &res) && res.ok();
+
+        if (ok)
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                store::guard g;
+                dchannel* c = store::upsert_channel(doc.root, 0);
+                if (c)
+                {
+                    store::bump_revision();
+                    stash_group_result(c->id);
+                    log_line("group: создана %llu", c->id);
+                }
+            }
+            doc.free_doc();
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Группа не создалась"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_group_remove(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[160];
+        cnprint(path, sizeof(path), "/channels/%llu/recipients/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+        if (api::call("DELETE", path, 0, &res) && res.ok())
+        {
+            log_line("group: -%llu из %llu", j->b, j->a);
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось убрать из группы"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_group_leave(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[160];
+        cnprint(path, sizeof(path), "/channels/%llu?silent=false", j->a);
+
+        http_response res;
+        res.init();
+        if (api::call("DELETE", path, 0, &res) && res.ok())
+        {
+            log_line("group: выход из %llu", j->a);
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось выйти"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_group_transfer(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu", j->a);
+
+        char body[64];
+        cnprint(body, sizeof(body), "{\"owner\":\"%llu\"}", j->b);
+
+        http_response res;
+        res.init();
+        if (api::call("PATCH", path, body, &res) && res.ok())
+        {
+            log_line("group: владение %llu -> %llu", j->a, j->b);
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Владение не передалось"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_simple_put_relationship(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/users/@me/relationships/%llu", j->a);
+
+        http_response res;
+        res.init();
+        // The field is not optional any more: without an explicit true
+        // discord refuses to accept a request from somebody it considers a
+        // stranger (400 code 80013).
+        const char* body = j->b ? "{\"confirm_stranger_request\":true}"
+                                : "{\"confirm_stranger_request\":false}";
+        if (!(api::call("PUT", path, body, &res, "Friends") && res.ok()))
+            record_api_error(tr("Заявка в друзья не принята"), &res);
+        else
+            api::clear_last_error();
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_delete_relationship(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/users/@me/relationships/%llu", j->a);
+
+        http_response res;
+        res.init();
+        if (api::call("DELETE", path, 0, &res, "Friends") && res.ok())
+        {
+            store::guard g;
+            store::remove_relationship(j->a);
+            store::bump_revision();
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось изменить отношение"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    struct job_forum_list
+    {
+        snowflake forum;
+        int offset;
+    };
+
+    struct job_forum_post
+    {
+        snowflake forum;
+        char name[128];
+        char content[4096];
+        snowflake tags[12];
+        int tag_count;
+    };
+
+    // The last forum-post creation, read once by the interface. Keyed by
+    // forum because two of them can be in flight at once.
+    snowflake g_forum_post_forum = 0;
+    snowflake g_forum_post_thread = 0;
+    bool g_forum_post_have = false;
+    bool g_forum_post_ok = false;
+    char g_forum_post_error[256];
+    // A creation in flight, by forum. Separate from history_loading (which
+    // the post list uses): composing while the list loads must not wedge
+    // either of them.
+    snowflake g_forum_post_busy = 0;
+
+    void job_fetch_forum_list(void* user)
+    {
+        job_forum_list* j = (job_forum_list*)user;
+
+        snowflake guild = 0;
+        {
+            store::guard g;
+            dchannel* f = store::find_channel(j->forum);
+            if (f) guild = f->guild_id;
+        }
+
+        const int LIMIT = 25;
+        int attempt = 0;
+        bool done = false;
+
+        while (!done && attempt < 6)
+        {
+            attempt++;
+
+            char path[256];
+            if (j->offset > 0)
+                cnprint(path, sizeof(path), "/channels/%llu/threads/search?sort_by=last_message_time&sort_order=desc&limit=%d&offset=%d",
+                        j->forum, LIMIT, j->offset);
+            else
+                cnprint(path, sizeof(path), "/channels/%llu/threads/search?sort_by=last_message_time&sort_order=desc&limit=%d",
+                        j->forum, LIMIT);
+
+            http_response res;
+            res.init();
+            bool ok = api::call("GET", path, 0, &res);
+
+            if (ok && res.status == 202)
+            {
+                // The search index is still building: discord says in the
+                // body when to come back.
+                double wait = 1.0;
+                jdoc doc;
+                doc.init();
+                if (doc.parse(res.text(), (int)res.body.size))
+                    wait = doc.root->dbl("retry_after", 1.0);
+                doc.free_doc();
+                res.free_response();
+                if (wait < 1.0) wait = 1.0;
+                if (wait > 30.0) wait = 30.0;
+                log_line("forum: канал %llu, индекс не готов, повтор через %.0f с",
+                         j->forum, wait);
+                Sleep((DWORD)(wait * 1000.0));
+                continue;
+            }
+
+            if (ok && res.status == 429)
+            {
+                int wait = res.retry_after_ms > 0 ? res.retry_after_ms : 1000;
+                res.free_response();
+                log_line("forum: канал %llu, 429, пауза %d мс", j->forum, wait);
+                Sleep((DWORD)(wait + 200));
+                continue;
+            }
+
+            done = true;
+
+            if (ok && res.ok())
+            {
+                jdoc doc;
+                doc.init();
+                bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                              doc.root && doc.root->type == JTYPE_OBJ;
+                const jval* threads = parsed ? doc.root->arr("threads") : 0;
+
+                if (parsed && threads && threads->type == JTYPE_ARR)
+                {
+                    snowflake ids[32];
+                    int n = 0;
+
+                    {
+                        store::guard g;
+                        for (unsigned int i = 0; i < threads->count && n < 32; i++)
+                        {
+                            dchannel* t = store::upsert_channel(threads->at(i), guild);
+                            if (t && t->id) ids[n++] = t->id;
+                        }
+
+                        const jval* firsts = doc.root->arr("first_messages");
+                        if (firsts && firsts->type == JTYPE_ARR)
+                        {
+                            for (unsigned int i = 0; i < firsts->count; i++)
+                            {
+                                store::upsert_message(firsts->at(i));
+                                archive::put_json(firsts->at(i));
+                            }
+                        }
+                    }
+
+                    bool more = doc.root->boolean("has_more", false);
+                    store::set_forum_posts(j->forum, ids, n, more, j->offset > 0);
+                    store::bump_revision();
+                    log_line("forum: канал %llu, постов %d, has_more %d",
+                             j->forum, n, more ? 1 : 0);
+                }
+                else
+                {
+                    log_line("forum: канал %llu, ответ не разобран (http %d)",
+                             j->forum, res.status);
+                    if (j->offset == 0) store::fail_forum_posts(j->forum);
+                }
+                doc.free_doc();
+            }
+            else
+            {
+                log_line("forum: канал %llu, запрос не удался (http %d)",
+                         j->forum, res.status);
+                if (j->offset == 0) store::fail_forum_posts(j->forum);
+                record_api_error(tr("Посты форума не загрузились"), &res);
+            }
+
+            res.free_response();
+        }
+
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->forum);
+            if (ch) ch->history_loading = false;
+        }
+
+        memfree(j);
+    }
+
+    void job_create_forum_post(void* user)
+    {
+        job_forum_post* j = (job_forum_post*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->name);
+        w.kv_i64("auto_archive_duration", 1440);
+        w.key("applied_tags");
+        w.begin_arr();
+        for (int i = 0; i < j->tag_count; i++)
+        {
+            char id[24];
+            cnprint(id, sizeof(id), "%llu", j->tags[i]);
+            w.val_str(id);
+        }
+        w.end_arr();
+        w.key("message");
+        w.begin_obj();
+        w.kv_str("content", j->content);
+        w.end_obj();
+        w.end_obj();
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/threads?use_nested_fields=true", j->forum);
+
+        snowflake guild = 0;
+        {
+            store::guard g;
+            dchannel* f = store::find_channel(j->forum);
+            if (f) guild = f->guild_id;
+        }
+
+        http_response res;
+        res.init();
+
+        bool posted = false;
+        snowflake thread_id = 0;
+
+        if (api::call("POST", path, w.c_str(), &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) &&
+                doc.root && doc.root->type == JTYPE_OBJ)
+            {
+                const jval* t = doc.root->obj("thread");
+                if (t && t->type == JTYPE_OBJ)
+                {
+                    store::guard g;
+                    dchannel* tc = store::upsert_channel(t, guild);
+                    const jval* m = doc.root->obj("message");
+                    if (m && m->type == JTYPE_OBJ)
+                    {
+                        store::upsert_message(m);
+                        archive::put_json(m);
+                    }
+                    if (tc && tc->id)
+                    {
+                        thread_id = tc->id;
+                        store::prepend_forum_post(j->forum, thread_id);
+                        posted = true;
+                    }
+                    store::bump_revision();
+                }
+            }
+            doc.free_doc();
+
+            if (posted) log_line("forum: пост создан (%llu в %llu)", thread_id, j->forum);
+            else log_line("forum: пост не разобран (http %d)", res.status);
+        }
+
+        if (!posted)
+        {
+            // The server's own words for the dialog, when there are any.
+            char detail[256];
+            detail[0] = 0;
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* m = doc.root->str("message", 0);
+                if (m) ccstrncpy(detail, m, sizeof(detail) - 1);
+            }
+            doc.free_doc();
+
+            record_api_error(tr("Пост не создан"), &res);
+            log_line("forum: пост не создан (http %d)", res.status);
+
+            if (detail[0]) ccstrncpy(g_forum_post_error, detail, sizeof(g_forum_post_error) - 1);
+            else cnprint(g_forum_post_error, sizeof(g_forum_post_error), "%s", tr("Пост не создан"));
+        }
+
+        g_forum_post_forum = j->forum;
+        g_forum_post_thread = thread_id;
+        g_forum_post_ok = posted;
+        g_forum_post_have = true;
+        g_forum_post_busy = 0;
+
+        w.free_writer();
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_join_thread(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/thread-members/@me", j->a);
+
+        http_response res;
+        res.init();
+
+        // Idempotent: joining twice is fine, and reading usually works
+        // without it - this just makes sure writing does too.
+        if (!(api::call("PUT", path, 0, &res) && res.ok()))
+            log_line("thread: не вступили в %llu (http %d)", j->a, res.status);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_pins(void* user)
+    {        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/pins?limit=25", j->a);
+        log_line("pins: запрос для канала %llu", j->a);
+
+        http_response res;
+        res.init();
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root != 0;
+            // Note: arr, not obj - obj() only returns objects, and items is
+            // an array. Reading it through obj() yields the null dummy, the
+            // list stays empty, and the popup loads forever.
+            const jval* items = parsed ? doc.root->arr("items") : 0;
+
+            if (parsed && items && items->type == JTYPE_ARR)
+            {
+                snowflake ids[50];
+                int n = 0;
+
+                store::guard g;
+                for (unsigned int i = 0; i < items->count && n < 50; i++)
+                {
+                    const jval* m = items->at(i)->obj("message");
+                    if (!m || m->type != JTYPE_OBJ) continue;
+
+                    dmessage* mm = store::upsert_message(m);
+                    if (mm) ids[n++] = mm->id;
+                }
+                store::set_channel_pins(j->a, ids, n);
+                store::bump_revision();
+                log_line("pins: канал %llu, закрепов %d", j->a, n);
+            }
+            else
+            {
+                log_line("pins: канал %llu, ответ не разобран (http %d, %u байт)",
+                         j->a, res.status, res.body.size);
+                store::fail_channel_pins(j->a);
+
+                // Written next to the log as well: what the bytes actually
+                // were is the whole question when a 200 does not parse.
+                wchar_t path[MAX_PATH];
+                if (ufile::app_path(L"pins_last_response.txt", path, MAX_PATH))
+                {
+                    ubuffer dump;
+                    dump.init(1024);
+                    dump.append_fmt("status: %d\n", res.status);
+                    dump.append_str("body: ");
+                    if (res.body.size) dump.append(res.body.data, res.body.size);
+                    else dump.append_str("(пусто)");
+                    ufile::write_all(path, dump.data, dump.size);
+                    dump.free_buffer();
+                }
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            log_line("pins: канал %llu, запрос не удался (http %d)", j->a, res.status);
+            store::fail_channel_pins(j->a);
+            record_api_error(tr("Закрепы не загрузились"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_pin_message(void* user, bool pin)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[160];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/pins/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+        bool ok = pin ? api::call("PUT", path, 0, &res) && res.ok()
+                      : api::call("DELETE", path, 0, &res) && res.ok();
+
+        // The CHANNEL_PINS_UPDATE dispatch that follows refreshes the list;
+        // this only reports a refusal.
+        if (!ok)
+            record_api_error(pin ? tr("Сообщение не закрепилось") : tr("Закреп не снялся"), &res);
+        else
+            api::clear_last_error();
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_pin_add(void* user) { job_pin_message(user, true); }
+    void job_pin_remove(void* user) { job_pin_message(user, false); }
+
+    void job_block_user(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/users/@me/relationships/%llu", j->a);
+
+        http_response res;
+        res.init();
+        if (!(api::call("PUT", path, "{\"type\":2}", &res, "Friends") && res.ok()))
+            record_api_error(tr("Не удалось заблокировать"), &res);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    // Same as api::call, plus verbatim extra header lines. The captcha
+    // retry is the only one that needs headers no other request sends.
+    bool call_with_extra(const char* method, const char* path, const char* json_body,
+                         http_response* out, const char* location, const char* extra)
+    {
+        ubuffer headers;
+        headers.init();
+        build_headers(&headers, json_body ? "application/json" : 0, location);
+        if (extra && extra[0]) headers.append_str(extra);
+
+        char url[2048];
+        cnprint(url, sizeof(url), "%s%s", API_BASE, path);
+
+        unsigned int body_len = json_body ? (unsigned int)ccslenf(json_body) : 0;
+        bool ok = http::request(method, url, headers.c_str(), json_body, body_len, out);
+        headers.free_buffer();
+
+        if (ok && out->status == 429)
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(out->text(), (int)out->body.size))
+                out->retry_after_ms = (int)(doc.root->dbl("retry_after", 1.0) * 1000.0);
+            doc.free_doc();
+            if (out->retry_after_ms <= 0) out->retry_after_ms = 1000;
+        }
+        return ok;
+    }
+
+    // One attempt, then - on a captcha demand only - a solve in the default
+    // browser and a retry carrying the token. Returns the last answer either
+    // way; solved, when given, is the demand that was answered. The demand
+    // is also stashed in the globals, so the manual paste fallback in the
+    // friends UI still has something to show when the solve is cancelled.
+    // A 400 carrying a captcha demand, solved in the default browser.
+    // True with the demand in ch and a header-safe token in token_out.
+    // Stashes the demand in the globals too, for the manual paste fallback
+    // (friends UI) - unless the caller passes stash = false.
+    bool solve_response_captcha(http_response* res, const char* action,
+                                captcha::challenge* ch, char* token_out, int token_cap,
+                                bool stash)
+    {
+        if (!res || res->status != 400 || !ch || !token_out || token_cap <= 0)
+            return false;
+
+        jdoc doc;
+        doc.init();
+        bool demanded = doc.parse(res->text(), (int)res->body.size) &&
+                        captcha::parse_demand(doc.root, ch);
+        doc.free_doc();
+        if (!demanded) return false;
+
+        if (stash)
+        {
+        ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
+        ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
+        ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
+        ccstrncpy(g_captcha_sitekey, ch->sitekey, sizeof(g_captcha_sitekey) - 1);
+        ccstrncpy(g_captcha_rqtoken, ch->rqtoken, sizeof(g_captcha_rqtoken) - 1);
+        ccstrncpy(g_captcha_session, ch->session, sizeof(g_captcha_session) - 1);
+
+        }
+        log_line("captcha: %s, demand (%s)", action ? action : "?", ch->sitekey);
+
+        token_out[0] = 0;
+        if (!captcha::solve_blocking(ch, action, token_out, token_cap))
+            return false;
+
+        // The token rides a header line: anything with a line break in it is
+        // refused rather than sent.
+        for (const char* p = token_out; *p; p++)
+        {
+            if (*p == '\r' || *p == '\n')
+            {
+                ccfset(token_out, 0, token_cap);
+                return false;
+            }
+        }
+        return token_out[0] != 0;
+    }
+
+    void build_captcha_extra(const captcha::challenge* ch, const char* token,
+                             char* extra, int extra_cap)
+    {
+        // What the browser sends on a solved login: the key, the rqtoken
+        // the demand carried, and the session it belongs to. Absent parts
+        // are left out rather than sent empty.
+        if (ch->rqtoken[0] && ch->session[0])
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n"
+                                      "X-Captcha-Session-Id: %s\r\n",
+                    token, ch->rqtoken, ch->session);
+        else if (ch->rqtoken[0])
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n",
+                    token, ch->rqtoken);
+        else if (ch->session[0])
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\nX-Captcha-Session-Id: %s\r\n",
+                    token, ch->session);
+        else
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\n", token);
+    }
+
+    bool call_captcha_aware(const char* method, const char* path, const char* json_body,
+                            http_response* res, const char* location, const char* action,
+                            captcha::challenge* solved, bool stash)
+    {
+        if (api::call(method, path, json_body, res, location) && res->ok())
+            return true;
+        if (res->status != 400) return false;
+
+        captcha::challenge ch;
+        ccfset(&ch, 0, sizeof(ch));
+        char token[4096];
+        if (!solve_response_captcha(res, action, &ch, token, sizeof(token), stash))
+            return false;
+
+        char extra[4608];
+        build_captcha_extra(&ch, token, extra, sizeof(extra));
+
+        res->free_response();
+        res->init();
+        bool ok = call_with_extra(method, path, json_body, res, location, extra);
+
+        ccfset(token, 0, sizeof(token));
+        ccfset(extra, 0, sizeof(extra));
+
+        if (ok && res->ok() && solved) *solved = ch;
+        return ok && res->ok();
+    }
+
+    void job_friend_by_name(void* user)
+    {
+        job_friend* j = (job_friend*)user;
+
+        // Modern usernames have no discriminator; legacy ones use name#1234.
+        const char* hash = 0;
+        for (const char* p = j->name; *p; p++) if (*p == '#') hash = p;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        if (hash)
+        {
+            int name_len = (int)(hash - j->name);
+            w.key("username");
+            w.val_str(j->name, name_len);
+            w.kv_str("discriminator", hash + 1);
+        }
+        else
+        {
+            w.kv_str("username", j->name);
+            w.kv_null("discriminator");
+        }
+
+        // The note the request carries. The official client sends it beside
+        // the name, and the recipient sees it as a small line with the
+        // request - and as a type-67 message at the top of the fresh DM.
+        if (j->note[0]) w.kv_str("note", j->note);
+
+        // Carried only when the person has been through a captcha and handed
+        // the token back. Solving it is theirs to do; this passes it on.
+        if (j->captcha_key[0]) w.kv_str("captcha_key", j->captcha_key);
+        if (j->captcha_rqtoken[0]) w.kv_str("captcha_rqtoken", j->captcha_rqtoken);
+
+        w.end_obj();
+
+        http_response res;
+        res.init();
+        // Logged in full because this one keeps coming back 400 with nothing
+        // the error extractor can read, and the difference between what is
+        // sent and what a working client sends is the whole question.
+        log_line("friend: заявка на %s%s", j->name,
+                 j->captcha_key[0] ? " (с токеном капчи)" : "");
+
+        // A pasted token rides the body, the way it always has. A fresh
+        // demand goes through the browser harness instead, then retries
+        // with the token in the headers.
+        bool sent;
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+
+        if (j->captcha_key[0])
+        {
+            sent = api::call("POST", "/users/@me/relationships", w.c_str(), &res,
+                             "Add Friend");
+        }
+        else
+        {
+            sent = call_captcha_aware("POST", "/users/@me/relationships", w.c_str(), &res,
+                                      "Add Friend", tr("Заявка в друзья"), &solved);
+        }
+
+        if (!sent || !res.ok())
+            log_line("friend: ответ %d, тело %.400s", res.status,
+                     res.body.size ? res.text() : "(пусто)");
+
+        // Written next to the log line as well, because the log is rewritten
+        // at every start and the answer to this is wanted after the fact.
+        if (!sent || !res.ok())
+        {
+            wchar_t path[MAX_PATH];
+            if (ufile::app_path(L"friend_last_response.txt", path, MAX_PATH))
+            {
+                ubuffer dump;
+                dump.init(1024);
+                dump.append_fmt("request: %s\n", w.c_str());
+                dump.append_fmt("status: %d\n", res.status);
+                dump.append_str("body: ");
+                if (res.body.size) dump.append(res.body.data, res.body.size);
+                else dump.append_str("(пусто)");
+                ufile::write_all(path, dump.data, dump.size);
+                dump.free_buffer();
+            }
+        }
+
+        if (sent && res.ok())
+        {
+            char msg[192];
+            cnprint(msg, sizeof(msg), tr("Заявка отправлена: %s"), j->name);
+            api::set_last_error(msg);
+
+            // Solved elsewhere and retried with the token: report the solve
+            // the way the official client does, right after it worked.
+            if (j->captcha_key[0])
+                science::captcha_verified(g_captcha_sitekey, g_captcha_session);
+            else if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
+
+            api::clear_captcha();
+        }
+        else
+        {
+            // What the refusal is asking for, kept so the interface can put
+            // the challenge in front of the person and take their answer.
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const char* site = doc.root->str("captcha_sitekey", 0);
+                const char* rq = doc.root->str("captcha_rqtoken", 0);
+                const char* sess = doc.root->str("captcha_session_id", 0);
+
+                ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
+                ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
+                ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
+
+                if (site) ccstrncpy(g_captcha_sitekey, site, sizeof(g_captcha_sitekey) - 1);
+                if (rq) ccstrncpy(g_captcha_rqtoken, rq, sizeof(g_captcha_rqtoken) - 1);
+                if (sess) ccstrncpy(g_captcha_session, sess, sizeof(g_captcha_session) - 1);
+            }
+            doc.free_doc();
+
+            record_api_error(tr("Заявка не отправлена"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    // Percent encoding, for the one query parameter this client sends that
+    // can contain anything a person typed. Unreserved characters as RFC 3986
+    // lists them go through untouched; everything else becomes %XX.
+    void url_escape(const char* in, char* out, int cap)
+    {
+        static const char* HEX = "0123456789ABCDEF";
+        int at = 0;
+
+        for (const unsigned char* p = (const unsigned char*)in; *p && at < cap - 4; p++)
+        {
+            unsigned char c = *p;
+            bool plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                         (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+
+            if (plain)
+            {
+                out[at++] = (char)c;
+            }
+            else
+            {
+                out[at++] = '%';
+                out[at++] = HEX[c >> 4];
+                out[at++] = HEX[c & 0x0F];
+            }
+        }
+
+        out[at] = 0;
+    }
+
+    // Using an invite, the way the official client does it: look the code up
+    // first, report what came back, and only then join.
+    //
+    // One POST was what this did before, and discord answered it with a
+    // CAPTCHA - which is what it does to a client that joins a server it has
+    // never seen the preview of. The lookup is not decoration; it is the half
+    // of the exchange that makes the join credible.
+    // ---- invites that arrive in messages ---------------------------------
+
+    ulist<api::invite_card> g_cards;
+
+    struct job_card
+    {
+        char code[16];
+        snowflake message_id;
+        snowflake channel_id;
+        snowflake location_guild;
+        int channel_type;
+    };
+
+    api::invite_card* find_card(const char* code)
+    {
+        for (unsigned int i = 0; i < g_cards.count; i++)
+            if (ccscmp(g_cards[i].code, code) == 0) return &g_cards[i];
+        return 0;
+    }
+
+    void read_card(api::invite_card* card, const jval* root)
+    {
+        const jval* g = root->obj("guild");
+        card->guild_id = g->sf("id");
+
+        const char* name = g->str("name", 0);
+        if (name) ccstrncpy(card->guild_name, name, sizeof(card->guild_name) - 1);
+
+        const char* icon = g->str("icon", 0);
+        if (icon) ccstrncpy(card->guild_icon, icon, sizeof(card->guild_icon) - 1);
+
+        const jval* c = root->obj("channel");
+        card->channel_id = c->sf("id");
+        card->channel_type = c->i32("type", 0);
+
+        const char* cname = c->str("name", 0);
+        if (cname) ccstrncpy(card->channel_name, cname, sizeof(card->channel_name) - 1);
+
+        card->inviter_id = root->obj("inviter")->sf("id");
+        card->size_online = root->i32("approximate_presence_count", 0);
+        card->size_total = root->i32("approximate_member_count", 0);
+    }
+
+    void job_resolve_invite(void* user)
+    {
+        job_card* j = (job_card*)user;
+
+        // The chain discord expects around a panel: the invite being seen,
+        // then what the server said about it. Sent even when the code is
+        // dead - a link that has expired is an ordinary thing to come across,
+        // and a client that only ever reports the good ones is stranger than
+        // one that reports both.
+        science::invite_opened_in_message(j->code, j->message_id);
+
+        char path[192];
+        cnprint(path, sizeof(path),
+                "/invites/%s?with_counts=true&with_expiration=true", j->code);
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("GET", path, 0, &res) && res.ok();
+
+        api::invite_card card;
+        ccfset(&card, 0, sizeof(card));
+        ccstrncpy(card.code, j->code, sizeof(card.code) - 1);
+        card.done = true;
+        card.ok = ok;
+
+        science::invite_result found;
+        ccfset(&found, 0, sizeof(found));
+        found.code = j->code;
+        found.input_value = j->code;
+        found.status_code = res.status;
+        found.resolved = ok;
+
+        if (ok)
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                read_card(&card, doc.root);
+
+                found.guild_id = card.guild_id;
+                found.channel_id = card.channel_id;
+                found.inviter_id = card.inviter_id;
+                found.channel_type = card.channel_type;
+                found.size_total = card.size_total;
+                found.size_online = card.size_online;
+
+                store::guard g;
+                found.user_is_member = store::find_guild(card.guild_id) != 0;
+                card.already_member = found.user_is_member;
+            }
+
+            doc.free_doc();
+        }
+
+        science::invite_resolved(&found);
+
+        EnterCriticalSection(&g_err_lock);
+        api::invite_card* slot = find_card(j->code);
+        if (slot) *slot = card;
+        else      g_cards.push(card);
+        LeaveCriticalSection(&g_err_lock);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    // The header the official client puts on a join pressed from a panel. It
+    // names the message the panel is on, which is what tells discord this was
+    // a link somebody was shown rather than one they typed.
+    void embed_context(char* out, int cap, const job_card* j)
+    {
+        char instance[64];
+        cnprint(instance, sizeof(instance), "%llu:%s", j->message_id, j->code);
+
+        if (j->location_guild)
+            cnprint(out, cap,
+                    "{\"location\":\"Invite Button Embed\",\"location_guild_id\":\"%llu\","
+                    "\"location_channel_id\":\"%llu\",\"location_channel_type\":%d,"
+                    "\"location_message_id\":\"%llu\",\"invite_instance_id\":\"%s\"}",
+                    j->location_guild, j->channel_id, j->channel_type,
+                    j->message_id, instance);
+        else
+            cnprint(out, cap,
+                    "{\"location\":\"Invite Button Embed\",\"location_guild_id\":null,"
+                    "\"location_channel_id\":\"%llu\",\"location_channel_type\":%d,"
+                    "\"location_message_id\":\"%llu\",\"invite_instance_id\":\"%s\"}",
+                    j->channel_id, j->channel_type, j->message_id, instance);
+    }
+
+    void job_join_from_message(void* user)
+    {
+        job_card* j = (job_card*)user;
+
+        char instance[64];
+        cnprint(instance, sizeof(instance), "%llu:%s", j->message_id, j->code);
+
+        char context[512];
+        embed_context(context, sizeof(context), j);
+
+        jwriter body;
+        body.init();
+        body.begin_obj();
+        body.kv_str("session_id", gateway::session_id());
+        body.kv_str("invite_instance_id", instance);
+        body.end_obj();
+
+        char path[192];
+        cnprint(path, sizeof(path), "/invites/%s", j->code);
+
+        http_response res;
+        res.init();
+
+        if (api::call("POST", path, body.buf.c_str(), &res, context) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const jval* guild = doc.root->obj("guild");
+
+                InterlockedExchange64((volatile long long*)&g_joined_guild,
+                                      (long long)guild->sf("id"));
+
+                char msg[192];
+                cnprint(msg, sizeof(msg), tr("Вы присоединились: %s"),
+                        guild->str("name", tr("сервер")));
+                api::set_last_error(msg);
+            }
+            doc.free_doc();
+
+            EnterCriticalSection(&g_err_lock);
+            api::invite_card* slot = find_card(j->code);
+            if (slot) slot->already_member = true;
+            LeaveCriticalSection(&g_err_lock);
+        }
+        else
+        {
+            record_api_error(tr("Не удалось зайти по приглашению"), &res);
+        }
+
+        res.free_response();
+        body.free_writer();
+        memfree(j);
+    }
+
+    void job_join_guild(void* user)
+    {
+        job_name* j = (job_name*)user;
+
+        // What the person typed, kept whole. Discord reports it beside the
+        // code and the two are not the same thing - one is a link.
+        char typed[192];
+        ccstrncpy(typed, j->full[0] ? j->full : j->text, sizeof(typed) - 1);
+
+        char escaped[256];
+        url_escape(typed, escaped, sizeof(escaped));
+
+        char lookup[512];
+        cnprint(lookup, sizeof(lookup),
+                "/invites/%s?inputValue=%s&with_counts=true&with_expiration=true"
+                "&with_permissions=true",
+                j->text, escaped);
+
+        science::invite_result found;
+        ccfset(&found, 0, sizeof(found));
+        found.code = j->text;
+        found.input_value = typed;
+
+        char context[256];
+        cnprint(context, sizeof(context), "{\"location\":\"Join Guild\"}");
+
+        http_response probe;
+        probe.init();
+
+        // The envelope alone goes out while the lookup is in flight, and the
+        // event naming the code follows once it has answered - which is the
+        // order in the capture, thirty milliseconds after the GET rather than
+        // before it.
+        science::invite_opened(j->text);
+
+        if (api::call("GET", lookup, 0, &probe))
+        {
+            found.status_code = probe.status;
+            found.resolved = probe.ok();
+
+            jdoc doc;
+            doc.init();
+            if (probe.ok() && doc.parse(probe.text(), (int)probe.body.size))
+            {
+                const jval* guild = doc.root->obj("guild");
+                const jval* channel = doc.root->obj("channel");
+                const jval* inviter = doc.root->obj("inviter");
+
+                found.guild_id = guild->sf("id");
+                found.channel_id = channel->sf("id");
+                found.channel_type = channel->i32("type", 0);
+                found.inviter_id = inviter->sf("id");
+                found.size_total = doc.root->i32("approximate_member_count", 0);
+                found.size_online = doc.root->i32("approximate_presence_count", 0);
+
+                // Discord names the channel and its type in the header of the
+                // join itself, and refuses the ones that disagree with what
+                // the preview said.
+                if (found.guild_id && found.channel_id)
+                    cnprint(context, sizeof(context),
+                            "{\"location\":\"Join Guild\",\"location_guild_id\":\"%llu\","
+                            "\"location_channel_id\":\"%llu\",\"location_channel_type\":%d}",
+                            found.guild_id, found.channel_id, found.channel_type);
+            }
+            doc.free_doc();
+        }
+
+        probe.free_response();
+
+        // A person reads the preview before pressing join. The capture shows
+        // about seven tenths of a second between the two requests; going
+        // straight from one to the other is a thing only a script does, and
+        // this is the one request discord answers with a CAPTCHA.
+        Sleep(700);
+
+        char path[192];
+        cnprint(path, sizeof(path), "/invites/%s", j->text);
+
+        // The gateway session this join belongs to. The official client sends
+        // it and nothing else in the body.
+        jwriter body;
+        body.init();
+        body.begin_obj();
+        body.kv_str("session_id", gateway::session_id());
+        body.end_obj();
+
+        http_response res;
+        res.init();
+
+        // The one request discord answers with a CAPTCHA: a demand here
+        // opens the browser harness, then retries with the token.
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+
+        if (call_captcha_aware("POST", path, body.buf.c_str(), &res, context,
+                               tr("Вход на сервер"), &solved))
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const jval* guild = doc.root->obj("guild");
+
+                // Remembered for the interface to notice: a server that asks
+                // for roles and rules on the way in should ask now.
+                InterlockedExchange64((volatile long long*)&g_joined_guild,
+                                      (long long)guild->sf("id"));
+
+                const char* name = guild->str("name", tr("сервер"));
+                char msg[192];
+                cnprint(msg, sizeof(msg), tr("Вы присоединились: %s"), name);
+                api::set_last_error(msg);
+            }
+            doc.free_doc();
+
+            if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
+        }
+        else
+        {
+            record_api_error(tr("Не удалось использовать приглашение"), &res);
+        }
+
+        // Reported after the join rather than before it, which is the order
+        // the capture shows: the preview is described once it has been acted
+        // on, not while it is still being looked at.
+        science::invite_resolved(&found);
+
+        res.free_response();
+        body.free_writer();
+        memfree(j);
+    }
+
+    // ---- invites and webhooks --------------------------------------------
+
+    struct job_link
+    {
+        snowflake channel_id;
+        int max_age;
+        int max_uses;
+        bool temporary;
+        char name[96];
+    };
+
+    struct job_two_ids
+    {
+        snowflake from_channel;
+        snowflake to_channel;
+    };
+
+    // Makes an invite to a server and puts it in somebody's messages.
+    //
+    // Two requests, and they have to be in this order and in one job: the
+    // link does not exist until the first one answers, and firing both as
+    // separate jobs would race - the message would go out with whatever link
+    // happened to be in the shared slot at that moment, which after a second
+    // invite anywhere in the client is the wrong one.
+    void job_send_invite(void* user)
+    {
+        job_two_ids* j = (job_two_ids*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        // A day, and no limit on how many people use it. An invite handed to
+        // one person could be single use, but the person it is handed to is
+        // not always the person who opens it - a phone reads the link, the
+        // desktop uses it, and a one-use link is spent by then.
+        w.kv_i64("max_age", 86400);
+        w.kv_i64("max_uses", 0);
+        w.kv_bool("temporary", false);
+        w.kv_bool("unique", true);
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/channels/%llu/invites", j->from_channel);
+
+        http_response res;
+        res.init();
+
+        char code[32];
+        code[0] = 0;
+
+        if (api::call("POST", path, w.buf.c_str(), &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const char* got = doc.root->str("code", 0);
+                if (got) ccstrncpy(code, got, sizeof(code) - 1);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось создать приглашение"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+
+        if (!code[0]) { memfree(j); return; }
+
+        char link[96];
+        cnprint(link, sizeof(link), "https://discord.gg/%s", code);
+
+        api::send_message(j->to_channel, link, 0);
+        memfree(j);
+    }
+
+    void job_create_invite(void* user)
+    {
+        job_link* j = (job_link*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_i64("max_age", j->max_age);
+        w.kv_i64("max_uses", j->max_uses);
+        w.kv_bool("temporary", j->temporary);
+
+        // Without this discord hands back whatever equivalent invite already
+        // exists, which means asking for a one-use link can return somebody
+        // else's unlimited one made an hour ago.
+        w.kv_bool("unique", true);
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/channels/%llu/invites", j->channel_id);
+
+        http_response res;
+        res.init();
+
+        if (api::call("POST", path, w.buf.c_str(), &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            const char* code = 0;
+            if (doc.parse(res.text(), (int)res.body.size)) code = doc.root->str("code", 0);
+
+            if (code && code[0])
+            {
+                char url[128];
+                cnprint(url, sizeof(url), "https://discord.gg/%s", code);
+                api::set_last_link(url);
+            }
+            else
+            {
+                api::set_last_error(tr("Сервер не вернул код приглашения"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Приглашение"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    // Discord refuses a webhook whose name contains "discord" or "clyde", and
+    // says so as a bare "Invalid Form Body" that names no field. Worth catching
+    // here, where the reason can be given.
+    bool name_has(const char* name, const char* banned)
+    {
+        for (const char* p = name; *p; p++)
+        {
+            const char* a = p;
+            const char* b = banned;
+            while (*a && *b && cctolower(*a) == cctolower(*b)) { a++; b++; }
+            if (!*b) return true;
+        }
+        return false;
+    }
+
+    void job_create_webhook(void* user)
+    {
+        job_link* j = (job_link*)user;
+
+        if (name_has(j->name, "discord") || name_has(j->name, "clyde"))
+        {
+            api::set_last_error(tr("Имя вебхука не может содержать \"discord\" или \"clyde\""));
+            memfree(j);
+            return;
+        }
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->name[0] ? j->name : "webhook");
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/channels/%llu/webhooks", j->channel_id);
+
+        http_response res;
+        res.init();
+
+        if (api::call("POST", path, w.buf.c_str(), &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            snowflake id = 0;
+            const char* token = 0;
+            const char* ready = 0;
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                // The answer carries the finished address as well as the parts
+                // it is made of. Taking it whole means the client is not
+                // guessing at a url format that is discord's to change.
+                ready = doc.root->str("url", 0);
+                id = doc.root->sf("id");
+                token = doc.root->str("token", 0);
+            }
+
+            // The token is only ever shown at creation. Losing it means the
+            // webhook is unusable and has to be made again, so it goes straight
+            // where the caller can copy it.
+            if (ready && ready[0])
+            {
+                api::set_last_link(ready);
+            }
+            else if (id && token && token[0])
+            {
+                char url[256];
+                cnprint(url, sizeof(url), "https://discord.com/api/webhooks/%llu/%s", id, token);
+                api::set_last_link(url);
+            }
+            else
+            {
+                api::set_last_error(tr("Сервер не вернул адрес вебхука"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Вебхук"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    // ---- audit log and bans ----------------------------------------------
+
+    ulist<api::audit_row> g_audit;
+    volatile long g_audit_busy = 0;
+    volatile long g_audit_denied = 0;
+
+    ulist<api::ban_row> g_bans;
+    volatile long g_bans_busy = 0;
+    volatile long g_bans_denied = 0;
+
+    void job_fetch_audit(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/audit-logs?limit=50", j->a);
+
+        http_response res;
+        res.init();
+
+        bool called = api::call("GET", path, 0, &res);
+        InterlockedExchange(&g_audit_denied, (called && res.status == 403) ? 1 : 0);
+
+        if (called && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                // The names come with the log rather than being looked up one
+                // by one afterwards - a person who did something may have left
+                // the server since, and then nothing else knows who they were.
+                {
+                    store::guard g;
+                    const jval* users = doc.root->arr("users");
+                    for (unsigned int i = 0; i < users->count; i++)
+                        store::upsert_user(users->at(i));
+                }
+
+                EnterCriticalSection(&g_err_lock);
+                g_audit.clear();
+
+                const jval* rows = doc.root->arr("audit_log_entries");
+                for (unsigned int i = 0; i < rows->count; i++)
+                {
+                    const jval* v = rows->at(i);
+
+                    api::audit_row row;
+                    ccfset(&row, 0, sizeof(row));
+                    row.id = v->sf("id");
+                    row.action = v->i32("action_type", 0);
+                    row.actor = v->sf("user_id");
+                    row.target = v->sf("target_id");
+
+                    const char* why = v->str("reason", 0);
+                    if (why) ccstrncpy(row.reason, why, sizeof(row.reason) - 1);
+
+                    if (row.id) g_audit.push(row);
+                }
+                LeaveCriticalSection(&g_err_lock);
+            }
+            doc.free_doc();
+        }
+        else if (!g_audit_denied)
+        {
+            record_api_error(tr("Журнал аудита"), &res);
+        }
+
+        res.free_response();
+        InterlockedExchange(&g_audit_busy, 0);
+        memfree(j);
+    }
+
+    void job_fetch_bans(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/bans?limit=1000", j->a);
+
+        http_response res;
+        res.init();
+
+        bool called = api::call("GET", path, 0, &res);
+        InterlockedExchange(&g_bans_denied, (called && res.status == 403) ? 1 : 0);
+
+        if (called && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                EnterCriticalSection(&g_err_lock);
+                g_bans.clear();
+
+                for (unsigned int i = 0; i < doc.root->count; i++)
+                {
+                    const jval* v = doc.root->at(i);
+                    const jval* u = v->obj("user");
+
+                    api::ban_row row;
+                    ccfset(&row, 0, sizeof(row));
+                    row.user_id = u->sf("id");
+
+                    const char* name = u->str("global_name", 0);
+                    if (!name) name = u->str("username", 0);
+                    ccstrncpy(row.name, name ? name : tr("неизвестно"), sizeof(row.name) - 1);
+
+                    const char* why = v->str("reason", 0);
+                    ccstrncpy(row.reason, why ? why : "", sizeof(row.reason) - 1);
+
+                    if (row.user_id) g_bans.push(row);
+                }
+                LeaveCriticalSection(&g_err_lock);
+            }
+            doc.free_doc();
+        }
+        else if (!g_bans_denied)
+        {
+            record_api_error(tr("Список банов"), &res);
+        }
+
+        res.free_response();
+        InterlockedExchange(&g_bans_busy, 0);
+        memfree(j);
+    }
+
+    void job_kick(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/members/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+
+        // GUILD_MEMBER_REMOVE comes back on the gateway, so the member list
+        // is left to that rather than edited here.
+        if (!api::call("DELETE", path, 0, &res) || !res.ok())
+            record_api_error(tr("Не удалось выгнать"), &res);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_unban(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        snowflake guild_id = j->a;
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/bans/%llu", j->a, j->b);
+        memfree(j);
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("DELETE", path, 0, &res) && res.ok();
+        if (!ok) record_api_error(tr("Разбан"), &res);
+        res.free_response();
+
+        // Nothing announces a lifted ban, so the list is asked for again.
+        if (ok) api::fetch_bans(guild_id);
+    }
+
+    // ---- handing the server over -----------------------------------------
+
+    volatile long g_ownership_code_sent = 0;
+
+    // When it was mailed. The pincode does not last, and discord answers an
+    // expired one with the same "incorrect code" it gives a mistyped one, so
+    // the only way anybody can tell the two apart is by being told how old
+    // the code in front of them is. Written and read as one aligned 64-bit
+    // value, which needs no lock on the only platform this builds for.
+    volatile unsigned long long g_ownership_code_at = 0;
+
+    struct job_transfer
+    {
+        snowflake guild_id;
+        snowflake user_id;
+        char code[32];
+    };
+
+    void job_ownership_code(void* user)
+    {
+        job_transfer* j = (job_transfer*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/pincode", j->guild_id);
+
+        // No body at all. Discord answers 204 and puts a six digit code in the
+        // owner's mail; nothing about it comes back over the wire.
+        http_response res;
+        res.init();
+
+        bool ok = api::call("PUT", path, 0, &res) && res.ok();
+        if (ok)
+        {
+            g_ownership_code_at = unix_now_ms();
+            InterlockedExchange(&g_ownership_code_sent, 1);
+        }
+        else    record_api_error(tr("Код не отправлен"), &res);
+
+        // Logged because each one invalidates the code before it: two of these
+        // close together explain an "incorrect code" that is nobody's typo.
+        log_line("ownership: PUT /guilds/%llu/pincode -> %d", j->guild_id, res.status);
+
+        science::transfer_ownership_code_sent(j->guild_id, res.status);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_transfer_ownership(void* user)
+    {
+        job_transfer* j = (job_transfer*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_snowflake("owner_id", j->user_id);
+        w.kv_str("code", j->code);
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu", j->guild_id);
+
+        http_response res;
+        res.init();
+
+        if (api::call("PATCH", path, w.buf.c_str(), &res) && res.ok())
+        {
+            InterlockedExchange(&g_ownership_code_sent, 0);
+            api::set_last_error(tr("Сервер передан"));
+        }
+        else
+        {
+            record_api_error(tr("Не удалось передать сервер"), &res);
+        }
+
+        science::transfer_ownership_done(j->guild_id, res.status);
+
+        // The code itself stays out of the log - it is single use and there is
+        // nothing to learn from its value that its length does not say. What is
+        // worth keeping is discord's answer: a refusal here says only "Invalid
+        // Form Body" on screen unless the nested part came through.
+        log_line("ownership: PATCH /guilds/%llu owner=%llu code=%d симв -> %d %.300s",
+                 j->guild_id, j->user_id, (int)ccslenf(j->code), res.status,
+                 res.body.size ? res.text() : "");
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    job_transfer* make_transfer(snowflake guild_id, snowflake user_id, const char* code)
+    {
+        job_transfer* j = (job_transfer*)memalloc(sizeof(job_transfer));
+        if (!j) return 0;
+
+        ccfset(j, 0, sizeof(*j));
+        j->guild_id = guild_id;
+        j->user_id = user_id;
+        if (code) ccstrncpy(j->code, code, sizeof(j->code) - 1);
+        return j;
+    }
+
+    // ---- moderation ------------------------------------------------------
+    //
+    // Kicking somebody out of voice, silencing them for the whole server and
+    // timing them out are all one endpoint - PATCH on the member - differing
+    // only in which field the body carries. Banning is its own, and is here
+    // because it belongs to the same menu.
+
+    struct job_moderate
+    {
+        snowflake guild_id;
+        snowflake user_id;
+        int number;              // minutes, or seconds of messages to sweep
+        char field[48];
+        char value[48];          // written raw, so null and true are possible
+    };
+
+    void job_patch_member(void* user)
+    {
+        job_moderate* j = (job_moderate*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_raw(j->field, j->value);
+        w.end_obj();
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/members/%llu", j->guild_id, j->user_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Модерация"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_ban_member(void* user)
+    {
+        job_moderate* j = (job_moderate*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_i64("delete_message_seconds", j->number);
+        w.end_obj();
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/bans/%llu", j->guild_id, j->user_id);
+
+        snowflake guild_id = j->guild_id;
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("PUT", path, w.buf.c_str(), &res) && res.ok();
+        if (!ok) record_api_error(tr("Бан"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+
+        // A ban arrives as nothing on the gateway, so the list is re-read for
+        // whoever has the ban window open.
+        if (ok) api::fetch_bans(guild_id);
+    }
+
+    job_moderate* make_moderate_job(snowflake guild_id, snowflake user_id)
+    {
+        job_moderate* j = (job_moderate*)memalloc(sizeof(job_moderate));
+        if (j)
+        {
+            ccfset(j, 0, sizeof(*j));
+            j->guild_id = guild_id;
+            j->user_id = user_id;
+        }
+        return j;
+    }
+
+    // ---- the invites that already exist ----------------------------------
+
+    ulist<api::invite_row> g_invites;
+    volatile long g_invites_busy = 0;
+    volatile long g_invites_denied = 0;
+
+    void job_fetch_invites(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/invites", j->a);
+
+        http_response res;
+        res.init();
+
+        bool called = api::call("GET", path, 0, &res);
+
+        // Told apart deliberately: no invites and no permission to look both
+        // show an empty list, and only one of them is worth explaining.
+        InterlockedExchange(&g_invites_denied, (called && res.status == 403) ? 1 : 0);
+
+        if (called && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                EnterCriticalSection(&g_err_lock);
+                g_invites.clear();
+
+                for (unsigned int i = 0; i < doc.root->count; i++)
+                {
+                    const jval* v = doc.root->at(i);
+
+                    api::invite_row row;
+                    ccfset(&row, 0, sizeof(row));
+
+                    const char* code = v->str("code", 0);
+                    if (!code || !code[0]) continue;
+                    ccstrncpy(row.code, code, sizeof(row.code) - 1);
+
+                    row.channel_id = v->obj("channel")->sf("id");
+                    row.uses = v->i32("uses", 0);
+                    row.max_uses = v->i32("max_uses", 0);
+                    row.max_age = v->i32("max_age", 0);
+                    row.temporary = v->boolean("temporary", false);
+
+                    const char* who = v->obj("inviter")->str("global_name", 0);
+                    if (!who) who = v->obj("inviter")->str("username", 0);
+                    ccstrncpy(row.inviter, who ? who : "", sizeof(row.inviter) - 1);
+
+                    g_invites.push(row);
+                }
+                LeaveCriticalSection(&g_err_lock);
+            }
+            doc.free_doc();
+        }
+        else if (!g_invites_denied)
+        {
+            record_api_error(tr("Список приглашений"), &res);
+        }
+
+        res.free_response();
+        InterlockedExchange(&g_invites_busy, 0);
+        memfree(j);
+    }
+
+    struct job_code
+    {
+        snowflake guild_id;
+        char code[16];
+    };
+
+    void job_revoke_invite(void* user)
+    {
+        job_code* j = (job_code*)user;
+
+        snowflake guild_id = j->guild_id;
+        char path[64];
+        cnprint(path, sizeof(path), "/invites/%s", j->code);
+        memfree(j);
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("DELETE", path, 0, &res) && res.ok();
+        if (!ok) record_api_error(tr("Отзыв приглашения"), &res);
+        res.free_response();
+
+        if (ok) api::fetch_invites(guild_id);
+    }
+
+    // ---- the webhooks that already exist ---------------------------------
+
+    ulist<api::webhook_row> g_webhooks;
+    volatile long g_webhooks_busy = 0;
+
+    // ---- onboarding and the rules gate -----------------------------------
+
+    void read_emoji(api::onboard_option* o, const jval* v)
+    {
+        const jval* e = v->obj("emoji");
+        if (e->type != JTYPE_OBJ) return;
+
+        o->emoji_id = e->sf("id");
+        o->emoji_animated = e->boolean("animated", false);
+
+        const char* name = e->str("name", 0);
+        if (name) ccstrncpy(o->emoji_name, name, sizeof(o->emoji_name) - 1);
+    }
+
+    // `b` non-zero means this is a look rather than a load: nobody has opened
+    // the window, and the point is to find out whether it should be opened.
+    void job_fetch_onboarding(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/onboarding", j->a);
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                EnterCriticalSection(&g_err_lock);
+
+                g_prompts.clear_fast();
+                g_options.clear_fast();
+
+                // Answered already if either of these has anything in it. The
+                // first is what was chosen, the second what was put in front
+                // of them - and a panel that was seen and skipped should not
+                // reappear every time the server is opened.
+                g_onboard_answered = doc.root->arr("responses")->count > 0 ||
+                                     doc.root->obj("onboarding_prompts_seen")->size() > 0;
+
+                // A server can have the feature switched off and still answer
+                // with the prompts it once set up. Nothing is shown then.
+                if (doc.root->boolean("enabled", false))
+                {
+                    const jval* prompts = doc.root->arr("prompts");
+                    for (unsigned int i = 0; i < prompts->count; i++)
+                    {
+                        const jval* pv = prompts->at(i);
+
+                        api::onboard_prompt p;
+                        ccfset(&p, 0, sizeof(p));
+                        p.id = pv->sf("id");
+                        p.single_select = pv->boolean("single_select", false);
+                        p.required = pv->boolean("required", false);
+                        p.in_onboarding = pv->boolean("in_onboarding", false);
+
+                        const char* title = pv->str("title", 0);
+                        if (title) ccstrncpy(p.title, title, sizeof(p.title) - 1);
+
+                        p.first_option = (int)g_options.count;
+
+                        const jval* opts = pv->arr("options");
+                        for (unsigned int k = 0; k < opts->count; k++)
+                        {
+                            const jval* ov = opts->at(k);
+
+                            api::onboard_option o;
+                            ccfset(&o, 0, sizeof(o));
+                            o.id = ov->sf("id");
+
+                            const char* t = ov->str("title", 0);
+                            if (t) ccstrncpy(o.title, t, sizeof(o.title) - 1);
+
+                            const char* d = ov->str("description", 0);
+                            if (d) ccstrncpy(o.description, d, sizeof(o.description) - 1);
+
+                            read_emoji(&o, ov);
+
+                            const jval* roles = ov->arr("role_ids");
+                            for (unsigned int r = 0; r < roles->count && o.role_count < 8; r++)
+                                o.roles[o.role_count++] = roles->at(r)->as_snowflake();
+
+                            if (o.id) g_options.push(o);
+                        }
+
+                        p.option_count = (int)g_options.count - p.first_option;
+                        if (p.id) g_prompts.push(p);
+                    }
+                }
+
+                int shown = 0;
+                for (unsigned int i = 0; i < g_prompts.count; i++)
+                    if (g_prompts[i].in_onboarding && g_prompts[i].option_count) shown++;
+
+                bool worth = shown > 0 && !g_onboard_answered;
+
+                LeaveCriticalSection(&g_err_lock);
+
+                // Said out loud, because "the panel did not appear" has
+                // exactly four possible reasons and this line names which.
+                log_line("onboarding: %llu - включено %d, блоков на входе %d, "
+                         "уже отвечено %d", j->a,
+                         doc.root->boolean("enabled", false) ? 1 : 0, shown,
+                         g_onboard_answered ? 1 : 0);
+
+                if (j->b && worth)
+                    InterlockedExchange64((volatile long long*)&g_onboard_show,
+                                          (long long)j->a);
+            }
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        InterlockedDecrement(&g_onboard_busy);
+        memfree(j);
+    }
+
+    void job_fetch_rules(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/member-verification?with_guild=false", j->a);
+
+        http_response res;
+        res.init();
+
+        // A server without a rules gate answers 404, and that is an answer
+        // rather than a fault - most servers do not have one.
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            EnterCriticalSection(&g_err_lock);
+
+            free_rules();
+            g_rules_desc[0] = 0;
+            g_rules_version[0] = 0;
+
+            g_rules_raw.clear();
+            g_rules_raw.append(res.body.data, res.body.size);
+            g_rules_raw_ready = true;
+
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const char* ver = doc.root->str("version", 0);
+                if (ver) ccstrncpy(g_rules_version, ver, sizeof(g_rules_version) - 1);
+
+                const char* desc = doc.root->str("description", 0);
+                if (desc) ccstrncpy(g_rules_desc, desc, sizeof(g_rules_desc) - 1);
+
+                const jval* fields = doc.root->arr("form_fields");
+                for (unsigned int i = 0; i < fields->count; i++)
+                {
+                    const jval* vals = fields->at(i)->arr("values");
+                    for (unsigned int k = 0; k < vals->count; k++)
+                    {
+                        const char* line = vals->at(k)->as_str(0);
+                        if (!line || !line[0]) continue;
+
+                        int len = (int)ccslenf(line);
+                        char* copy = (char*)memalloc(len + 1);
+                        if (!copy) continue;
+
+                        ccpy(copy, line, (size_t)len);
+                        copy[len] = 0;
+                        g_rules.push(copy);
+                    }
+                }
+            }
+
+            doc.free_doc();
+            LeaveCriticalSection(&g_err_lock);
+        }
+
+        res.free_response();
+        InterlockedDecrement(&g_onboard_busy);
+        memfree(j);
+    }
+
+    struct job_onboard_submit
+    {
+        snowflake guild_id;
+        snowflake chosen[64];
+        int count;
+    };
+
+    void job_submit_onboarding(void* user)
+    {
+        job_onboard_submit* j = (job_onboard_submit*)user;
+
+        // The same stamp on everything, which is what the real client sends:
+        // it is the moment the panel was answered, not a time per option.
+        unsigned long long now = unix_now_ms();
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        w.key("onboarding_responses");
+        w.begin_arr();
+        for (int i = 0; i < j->count; i++)
+        {
+            char id[24];
+            cnprint(id, sizeof(id), "%llu", j->chosen[i]);
+            w.val_str(id);
+        }
+        w.end_arr();
+
+        EnterCriticalSection(&g_err_lock);
+
+        // Everything that was on the screen, said to have been on the screen.
+        // Only the prompts marked as part of the way in: the others live in
+        // the channel list and were never shown here.
+        w.key("onboarding_prompts_seen");
+        w.begin_obj();
+        for (unsigned int i = 0; i < g_prompts.count; i++)
+        {
+            if (!g_prompts[i].in_onboarding) continue;
+
+            char id[24];
+            cnprint(id, sizeof(id), "%llu", g_prompts[i].id);
+            w.kv_i64(id, (long long)now);
+        }
+        w.end_obj();
+
+        w.key("onboarding_responses_seen");
+        w.begin_obj();
+        for (unsigned int i = 0; i < g_prompts.count; i++)
+        {
+            if (!g_prompts[i].in_onboarding) continue;
+
+            int from = g_prompts[i].first_option;
+            for (int k = 0; k < g_prompts[i].option_count; k++)
+            {
+                char id[24];
+                cnprint(id, sizeof(id), "%llu", g_options[(unsigned int)(from + k)].id);
+                w.kv_i64(id, (long long)now);
+            }
+        }
+        w.end_obj();
+
+        LeaveCriticalSection(&g_err_lock);
+
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/onboarding-responses", j->guild_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("POST", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Не удалось сохранить выбор ролей"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_accept_rules(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        EnterCriticalSection(&g_err_lock);
+
+        bool have = g_rules_raw_ready && g_rules_raw.size > 0;
+
+        jdoc doc;
+        doc.init();
+
+        if (have && doc.parse((const char*)g_rules_raw.data, (int)g_rules_raw.size))
+        {
+            const char* ver = doc.root->str("version", 0);
+            w.kv_str("version", ver ? ver : "");
+
+            // The fields as they came, each with an answer added. Copied
+            // rather than rebuilt: discord matches this against what it sent,
+            // and a field left out is a form it will not accept.
+            w.key("form_fields");
+            w.begin_arr();
+
+            const jval* fields = doc.root->arr("form_fields");
+            for (unsigned int i = 0; i < fields->count; i++)
+            {
+                const jval* f = fields->at(i);
+
+                w.begin_obj();
+                w.kv_str("field_type", f->str("field_type", "TERMS"));
+                w.kv_str("label", f->str("label", ""));
+                w.kv_null("description");
+                w.kv_null("automations");
+                w.kv_bool("required", f->boolean("required", true));
+
+                w.key("values");
+                w.begin_arr();
+                const jval* vals = f->arr("values");
+                for (unsigned int k = 0; k < vals->count; k++)
+                {
+                    const char* line = vals->at(k)->as_str(0);
+                    if (line) w.val_str(line);
+                }
+                w.end_arr();
+
+                w.kv_bool("response", true);
+                w.end_obj();
+            }
+
+            w.end_arr();
+        }
+
+        doc.free_doc();
+        LeaveCriticalSection(&g_err_lock);
+
+        w.end_obj();
+
+        if (!have) { w.free_writer(); memfree(j); return; }
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/requests/@me", j->a);
+
+        http_response res;
+        res.init();
+
+        if (api::call("PUT", path, w.buf.c_str(), &res) && res.ok())
+            api::set_last_error(tr("Правила приняты"));
+        else
+            record_api_error(tr("Не удалось принять правила"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_fetch_webhooks(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/webhooks", j->a);
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                EnterCriticalSection(&g_err_lock);
+                g_webhooks.clear();
+
+                for (unsigned int i = 0; i < doc.root->count; i++)
+                {
+                    const jval* h = doc.root->at(i);
+
+                    api::webhook_row row;
+                    ccfset(&row, 0, sizeof(row));
+                    row.id = h->sf("id");
+                    row.channel_id = h->sf("channel_id");
+
+                    const char* name = h->str("name", 0);
+                    ccstrncpy(row.name, name ? name : tr("без имени"), sizeof(row.name) - 1);
+
+                    // Only incoming webhooks carry one. The others are
+                    // follower and application hooks, which cannot be
+                    // posted through and come back without it.
+                    const char* token = h->str("token", 0);
+                    if (token) ccstrncpy(row.token, token, sizeof(row.token) - 1);
+
+                    if (row.id) g_webhooks.push(row);
+                }
+                LeaveCriticalSection(&g_err_lock);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Список вебхуков"), &res);
+        }
+
+        res.free_response();
+        InterlockedExchange(&g_webhooks_busy, 0);
+        memfree(j);
+    }
+
+    struct hook_post
+    {
+        snowflake id;
+        char token[128];
+        char username[96];
+        char avatar[512];
+        char content[3900];
+    };
+
+    void job_webhook_post(void* user)
+    {
+        hook_post* j = (hook_post*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("content", j->content);
+        if (j->username[0]) w.kv_str("username", j->username);
+        if (j->avatar[0]) w.kv_str("avatar_url", j->avatar);
+        w.end_obj();
+
+        char url[256];
+        cnprint(url, sizeof(url), "%s/webhooks/%llu/%s", API_BASE, j->id, j->token);
+
+        // Sent bare, without any of the headers the rest of this file
+        // builds. The url is the credential - a webhook answers to whoever
+        // holds it and to nobody else - and attaching this account's token
+        // to it would say who is really typing, which is the one thing the
+        // feature exists to avoid.
+        const char* headers = "Content-Type: application/json\r\n";
+
+        http_response res;
+        res.init();
+
+        if (!http::request("POST", url, headers, w.buf.c_str(), w.buf.size, &res) || !res.ok())
+            record_api_error(tr("Вебхук не принял сообщение"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_delete_webhook(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        // Read out before the job is freed, because the refresh below outlives
+        // it and asking afterwards reads memory that has been handed back.
+        snowflake webhook_id = j->a;
+        snowflake guild_id = j->b;
+        memfree(j);
+
+        char path[96];
+        cnprint(path, sizeof(path), "/webhooks/%llu", webhook_id);
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("DELETE", path, 0, &res) && res.ok();
+        if (!ok) record_api_error(tr("Удаление вебхука"), &res);
+        res.free_response();
+
+        // Nothing announces a deleted webhook, so the list is asked for again
+        // rather than edited here: the server is the only thing that knows
+        // what is left.
+        if (ok) api::fetch_webhooks(guild_id);
+    }
+
+    // ---- channels ---------------------------------------------------------
+
+    struct job_channel
+    {
+        snowflake guild_id;
+        snowflake parent_id;
+        int type;
+        char name[96];
+    };
+
+    void job_create_channel(void* user)
+    {
+        job_channel* j = (job_channel*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->name);
+        w.kv_i64("type", j->type);
+
+        // A category cannot sit inside another, and sending a parent for one is
+        // rejected rather than ignored.
+        if (j->parent_id && j->type != 4) w.kv_snowflake("parent_id", j->parent_id);
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/channels", j->guild_id);
+
+        http_response res;
+        res.init();
+
+        // Nothing is written into the store: CHANNEL_CREATE arrives on the
+        // gateway and is already handled there.
+        if (!api::call("POST", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Создание канала"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_delete_channel(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[96];
+        cnprint(path, sizeof(path), "/channels/%llu", j->a);
+
+        http_response res;
+        res.init();
+
+        // CHANNEL_DELETE arrives on the gateway, so nothing is removed here.
+        if (!api::call("DELETE", path, 0, &res) || !res.ok())
+            record_api_error(tr("Удаление канала"), &res);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    struct job_order
+    {
+        snowflake guild_id;
+        snowflake reparented;
+        snowflake parent_id;
+        int count;
+        snowflake ids[256];
+    };
+
+    void job_reorder_channels(void* user)
+    {
+        job_order* j = (job_order*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_arr();
+
+        for (int i = 0; i < j->count; i++)
+        {
+            w.begin_obj();
+            w.kv_snowflake("id", j->ids[i]);
+            w.kv_i64("position", i);
+
+            // Only for the one that actually moved between categories. Sent for
+            // every entry it would drag the whole list into one category.
+            if (j->ids[i] == j->reparented)
+            {
+                if (j->parent_id) w.kv_snowflake("parent_id", j->parent_id);
+                else              w.kv_null("parent_id");
+            }
+            w.end_obj();
+        }
+        w.end_arr();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/channels", j->guild_id);
+
+        http_response res;
+        res.init();
+
+        // CHANNEL_UPDATE arrives for each moved channel, so nothing is
+        // reordered here.
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Порядок каналов"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_create_guild(void* user)
+    {
+        job_name* j = (job_name*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->text);
+        w.kv_null("icon");
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        // GUILD_CREATE follows on the gateway with the whole server in it.
+        if (!api::call("POST", "/guilds", w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Создание сервера"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    struct job_overwrite
+    {
+        snowflake channel_id;
+        snowflake target_id;
+        unsigned long long allow;
+        unsigned long long deny;
+        bool is_role;
+        bool clearing;
+    };
+
+    void job_channel_overwrite(void* user)
+    {
+        job_overwrite* j = (job_overwrite*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/permissions/%llu",
+                j->channel_id, j->target_id);
+
+        http_response res;
+        res.init();
+
+        if (j->clearing)
+        {
+            if (!api::call("DELETE", path, 0, &res) || !res.ok())
+                record_api_error(tr("Сброс прав канала"), &res);
+        }
+        else
+        {
+            jwriter w;
+            w.init();
+            w.begin_obj();
+            w.kv_i64("type", j->is_role ? 0 : 1);
+
+            // Strings, for the same reason role permissions are: there are more
+            // of these bits than a json number can carry without rounding the
+            // top ones away.
+            char bits[32];
+            cnprint(bits, sizeof(bits), "%llu", j->allow);
+            w.kv_str("allow", bits);
+            cnprint(bits, sizeof(bits), "%llu", j->deny);
+            w.kv_str("deny", bits);
+            w.end_obj();
+
+            if (!api::call("PUT", path, w.buf.c_str(), &res) || !res.ok())
+                record_api_error(tr("Права канала"), &res);
+
+            w.free_writer();
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    // ---- roles -----------------------------------------------------------
+
+    struct job_role
+    {
+        snowflake guild_id;
+        snowflake role_id;
+        snowflake user_id;
+        unsigned long long permissions;
+        unsigned int color;
+        bool hoist;
+        bool mentionable;
+        char name[128];
+    };
+
+    job_role* make_role_job(snowflake guild_id)
+    {
+        job_role* j = (job_role*)memalloc(sizeof(job_role));
+        if (j)
+        {
+            ccfset(j, 0, sizeof(*j));
+            j->guild_id = guild_id;
+        }
+        return j;
+    }
+
+    // Adding and removing differ by one word, so they share everything else.
+    void role_membership(void* user, const char* method)
+    {
+        job_role* j = (job_role*)user;
+
+        char path[160];
+        cnprint(path, sizeof(path), "/guilds/%llu/members/%llu/roles/%llu",
+                j->guild_id, j->user_id, j->role_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call(method, path, 0, &res) || !res.ok())
+            api::set_last_error(tr("Не удалось изменить роли участника"));
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_add_member_role(void* user) { role_membership(user, "PUT"); }
+    void job_remove_member_role(void* user) { role_membership(user, "DELETE"); }
+
+    void job_create_role(void* user)
+    {
+        job_role* j = (job_role*)user;
+
+        // Named only. Everything else is left at the server's defaults, and
+        // whoever created it edits it from the same panel a moment later - one
+        // request that can fail instead of two.
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->name[0] ? j->name : tr("новая роль"));
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/roles", j->guild_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("POST", path, w.buf.c_str(), &res) || !res.ok())
+            api::set_last_error(tr("Не удалось создать роль"));
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_delete_role(void* user)
+    {
+        job_role* j = (job_role*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/roles/%llu", j->guild_id, j->role_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("DELETE", path, 0, &res) || !res.ok())
+            api::set_last_error(tr("Не удалось удалить роль"));
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_edit_role(void* user)
+    {
+        job_role* j = (job_role*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->name);
+
+        // Permissions travel as a decimal string, not a number: there are more
+        // than fifty three of them now, and a json number cannot carry the top
+        // ones without rounding them away.
+        {
+            char bits[32];
+            cnprint(bits, sizeof(bits), "%llu", j->permissions);
+            w.kv_str("permissions", bits);
+        }
+
+        w.kv_i64("color", (long long)j->color);
+        w.kv_bool("hoist", j->hoist);
+        w.kv_bool("mentionable", j->mentionable);
+        w.end_obj();
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/roles/%llu", j->guild_id, j->role_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            api::set_last_error(tr("Не удалось изменить роль"));
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_leave_guild(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/users/@me/guilds/%llu", j->a);
+
+        http_response res;
+        res.init();
+        if (api::call("DELETE", path, "{\"lurking\":false}", &res) && res.ok())
+        {
+            store::guard g;
+            store::remove_guild(j->a);
+        }
+        else
+        {
+            record_api_error(tr("Не удалось покинуть сервер"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_delete_guild(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/delete", j->a);
+
+        // POST with no body at all, and nothing comes back but a 204. Notably
+        // there is no science event for this one - the real client sends none,
+        // and inventing one would be the only packet here that discord has
+        // never seen.
+        http_response res;
+        res.init();
+
+        if (api::call("POST", path, 0, &res) && res.ok())
+        {
+            store::guard g;
+            store::remove_guild(j->a);
+        }
+        else
+        {
+            record_api_error(tr("Не удалось удалить сервер"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void ack_request(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[192];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/%llu/ack", j->a, j->b);
+
+        http_response res;
+        res.init();
+        api::call("POST", path, "{\"token\":null}", &res);
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_typing(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/typing", j->a);
+
+        http_response res;
+        res.init();
+        api::call("POST", path, "", &res);
+        res.free_response();
+        memfree(j);
+    }
+
+    struct job_edit
+    {
+        snowflake channel_id;
+        snowflake message_id;
+        char content[3900];
+    };
+
+    void job_edit_message(void* user)
+    {
+        job_edit* j = (job_edit*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("content", j->content);
+        w.end_obj();
+
+        char path[192];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/%llu",
+                j->channel_id, j->message_id);
+
+        http_response res;
+        res.init();
+
+        // MESSAGE_UPDATE comes back on the gateway with the new text and the
+        // edited stamp, so nothing is written here - the same as sending one.
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Сообщение не изменено"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    struct interact_args
+    {
+        snowflake guild_id;
+        snowflake channel_id;
+        snowflake message_id;
+        snowflake application_id;
+
+        int component_type;
+        char custom_id[128];
+
+        char values[8][100];
+        int value_count;
+
+        // The message's own flags, echoed back. A Components-V2 message
+        // carries 32768 here; the official client sends what the message
+        // has, so this does the same.
+        int message_flags;
+    };
+
+    void stash_modal(const api::modal_form* form)
+    {
+        EnterCriticalSection(&g_modal_lock);
+        g_pending_modal = *form;
+        g_modal_ready = true;
+        LeaveCriticalSection(&g_modal_lock);
+    }
+
+    // One input of a modal: either the input itself or the label wrapped
+    // round it (type 18), or an action row holding it.
+    bool parse_modal_field(const jval* node, api::modal_field* f)
+    {
+        if (!node || node->type != JTYPE_OBJ || !f) return false;
+
+        char wrap_label[160];
+        ccfset(wrap_label, 0, sizeof(wrap_label));
+
+        const jval* input = node;
+        int ntype = node->i32("type", 0);
+
+        if (ntype == V2_LABEL)
+        {
+            const char* l = node->str("label", 0);
+            if (l) ccstrncpy(wrap_label, l, sizeof(wrap_label) - 1);
+
+            input = node->obj("component");
+            if (input->type != JTYPE_OBJ) return false;
+        }
+        else if (ntype == COMP_ROW)
+        {
+            const jval* kids = node->arr("components");
+            if (kids->type != JTYPE_ARR || !kids->count) return false;
+            input = kids->at(0);
+        }
+
+        const char* cid = input->str("custom_id", 0);
+        if (!cid || !cid[0]) return false;
+
+        ccfset(f, 0, sizeof(*f));
+        ccstrncpy(f->custom_id, cid, sizeof(f->custom_id) - 1);
+
+        int kind = input->i32("type", 0);
+        f->kind = kind;
+
+        const char* l = input->str("label", 0);
+        if (l && l[0]) ccstrncpy(f->label, l, sizeof(f->label) - 1);
+        else if (wrap_label[0]) ccstrncpy(f->label, wrap_label, sizeof(f->label) - 1);
+
+        const char* p = input->str("placeholder", 0);
+        if (p) ccstrncpy(f->placeholder, p, sizeof(f->placeholder) - 1);
+
+        f->required = input->boolean("required", false);
+        f->min_len = input->i32("min_length", 0);
+        f->max_len = input->i32("max_length", 0);
+        f->style = input->i32("style", 1);
+
+        const char* v = input->str("value", 0);
+        if (v) ccstrncpy(f->text, v, sizeof(f->text) - 1);
+
+        f->selected = -1;
+        f->min_values = input->i32("min_values", 0);
+        f->max_values = input->i32("max_values", 1);
+
+        const jval* opts = input->arr("options");
+        if (opts->type == JTYPE_ARR)
+        {
+            for (unsigned int o = 0; o < opts->count && f->option_count < 25; o++)
+            {
+                const jval* ov = opts->at(o);
+                api::modal_option* dst = &f->options[f->option_count];
+
+                const char* ol = ov->str("label", 0);
+                const char* ovv = ov->str("value", 0);
+                if (!ol || !ovv) continue;
+
+                ccstrncpy(dst->label, ol, sizeof(dst->label) - 1);
+                ccstrncpy(dst->value, ovv, sizeof(dst->value) - 1);
+
+                const char* od = ov->str("description", 0);
+                if (od) ccstrncpy(dst->description, od, sizeof(dst->description) - 1);
+
+                f->option_count++;
+            }
+        }
+
+        return true;
+    }
+
+    // The "data" half of a type-9 interaction response: the form itself.
+    bool parse_modal_response(const jval* data, api::modal_form* form,
+                              snowflake guild_id, snowflake channel_id,
+                              snowflake application_id)
+    {
+        if (!data || data->type != JTYPE_OBJ || !form) return false;
+
+        ccfset(form, 0, sizeof(*form));
+        form->guild_id = guild_id;
+        form->channel_id = channel_id;
+        form->application_id = application_id;
+
+        const char* title = data->str("title", 0);
+        ccstrncpy(form->title, title && title[0] ? title : tr("Форма"), sizeof(form->title) - 1);
+
+        const char* cid = data->str("custom_id", 0);
+        if (!cid || !cid[0]) return false;
+        ccstrncpy(form->custom_id, cid, sizeof(form->custom_id) - 1);
+
+        // data.id arrives as a string, not a number; absent means the submit
+        // carries no id at all.
+        const char* sid = data->str("id", 0);
+        if (sid) ccstrncpy(form->submit_id, sid, sizeof(form->submit_id) - 1);
+
+        const jval* rows = data->arr("components");
+        if (rows->type != JTYPE_ARR) return false;
+
+        for (unsigned int i = 0; i < rows->count && form->field_count < 12; i++)
+        {
+            api::modal_field f;
+            if (!parse_modal_field(rows->at(i), &f)) continue;
+            form->fields[form->field_count++] = f;
+        }
+
+        return form->field_count > 0;
+    }
+
+    // Pressing a button or choosing from a menu.
+    //
+    // Not a message and not a reaction: it is an interaction, which discord
+    // routes to the application that put the component there. The answer is
+    // usually empty - what happens next arrives over the gateway as the bot
+    // editing its message or sending another.
+    //
+    // Usually. A button that opens a form is answered on the spot with a
+    // type-9 interaction response carrying the form itself, which is parsed
+    // here and handed to the interface. There is no separate fetch for it:
+    // the definition arrives in this response, not over the gateway.
+    //
+    // The session id is part of it. Discord uses it to decide which of the
+    // account's open clients gets shown an ephemeral reply, and an
+    // interaction without one is answered but never seen.
+    void job_interact(void* user)
+    {
+        interact_args* j = (interact_args*)user;
+
+        unsigned long long nonce = 0;
+        crypto::random_bytes(&nonce, sizeof(nonce));
+        note_modal_nonce(nonce);
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        // 3 is "somebody used a component". 2 would be a slash command.
+        w.kv_i64("type", 3);
+        w.kv_snowflake("nonce", nonce);
+
+        // Absent in a direct message rather than zero: discord reads a guild
+        // id that is not a guild as a request about somewhere else.
+        if (j->guild_id) w.kv_snowflake("guild_id", j->guild_id);
+
+        w.kv_snowflake("channel_id", j->channel_id);
+        w.kv_i64("message_flags", j->message_flags);
+        w.kv_snowflake("message_id", j->message_id);
+        w.kv_snowflake("application_id", j->application_id);
+        w.kv_str("session_id", gateway::session_id());
+
+        w.key("data");
+        w.begin_obj();
+        w.kv_i64("component_type", j->component_type);
+        w.kv_str("custom_id", j->custom_id);
+
+        if (j->component_type == COMP_SELECT)
+        {
+            w.kv_i64("type", COMP_SELECT);
+
+            w.key("values");
+            w.begin_arr();
+            for (int i = 0; i < j->value_count; i++) w.val_str(j->values[i]);
+            w.end_arr();
+        }
+
+        w.end_obj();
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("POST", "/interactions", w.buf.c_str(), &res);
+        bool modal = false;
+
+        if (ok && res.status == 200 && res.body.size)
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root &&
+                doc.root->i32("type", 0) == 9)
+            {
+                api::modal_form form;
+                if (parse_modal_response(doc.root->obj("data"), &form,
+                                         j->guild_id, j->channel_id, j->application_id))
+                {
+                    stash_modal(&form);
+                    modal = true;
+                    log_line("interaction: форма \"%s\", полей %d", form.title, form.field_count);
+                }
+            }
+            if (!modal)
+            {
+                // Not a form, but worth seeing once: this request was written
+                // from the protocol rather than from a capture of the real
+                // client, so the first thing worth knowing about a button
+                // that does nothing is what discord said about it.
+                log_line("interaction: ответ %d %.500s", res.status, res.text());
+            }
+            doc.free_doc();
+        }
+
+        if (!modal)
+        {
+            ok = ok && res.ok();
+
+            // Logged either way. This request was written from the protocol
+            // rather than from a capture of the real client, so the first thing
+            // worth knowing about a button that does nothing is what discord said
+            // about it.
+            log_line("interaction: %s %s -> %d %.200s",
+                     j->component_type == COMP_SELECT ? "меню" : "кнопка",
+                     j->custom_id, res.status, res.body.size ? res.text() : "");
+
+            if (!ok) record_api_error(tr("Кнопка не сработала"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    struct modal_submit_args
+    {
+        api::modal_form form;
+    };
+
+    // Sends the filled form back: interaction type 5, shaped after a capture
+    // of the official client. Every field goes back wrapped in its label
+    // node; text answers ride as "value", menus and anything unrecognised
+    // as "values" (null when left empty).
+    void job_modal_submit(void* user)
+    {
+        modal_submit_args* j = (modal_submit_args*)user;
+        const api::modal_form* f = &j->form;
+
+        unsigned long long nonce = 0;
+        crypto::random_bytes(&nonce, sizeof(nonce));
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        w.kv_i64("type", 5);
+        w.kv_snowflake("application_id", f->application_id);
+        w.kv_snowflake("channel_id", f->channel_id);
+        if (f->guild_id) w.kv_snowflake("guild_id", f->guild_id);
+
+        w.key("data");
+        w.begin_obj();
+        if (f->submit_id[0]) w.kv_str("id", f->submit_id);
+        w.kv_str("custom_id", f->custom_id);
+
+        w.key("components");
+        w.begin_arr();
+        for (int i = 0; i < f->field_count; i++)
+        {
+            const api::modal_field* fd = &f->fields[i];
+
+            w.begin_obj();
+            w.kv_i64("type", V2_LABEL);
+            w.key("component");
+            w.begin_obj();
+            w.kv_i64("type", fd->kind);
+            w.kv_str("custom_id", fd->custom_id);
+
+            if (fd->kind == COMP_TEXTINPUT)
+            {
+                w.kv_str("value", fd->text);
+            }
+            else if (fd->selected >= 0 && fd->selected < fd->option_count)
+            {
+                w.key("values");
+                w.begin_arr();
+                w.val_str(fd->options[fd->selected].value);
+                w.end_arr();
+            }
+            else
+            {
+                w.kv_null("values");
+            }
+
+            w.end_obj();
+            w.end_obj();
+        }
+        w.end_arr();
+        w.end_obj();
+
+        w.kv_str("session_id", gateway::session_id());
+        w.kv_snowflake("nonce", nonce);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("POST", "/interactions", w.buf.c_str(), &res) && res.ok();
+
+        log_line("interaction: форма \"%s\" -> %d %.200s",
+                 f->custom_id, res.status, res.body.size ? res.text() : "");
+
+        if (!ok) record_api_error(tr("Форма не отправилась"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_delete_message(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[192];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+        if (api::call("DELETE", path, 0, &res) && res.ok())
+        {
+            store::guard g;
+            store::remove_message(j->a, j->b);
+            store::bump_revision();
+        }
+        else
+        {
+            record_api_error(tr("Сообщение не удалено"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_ring(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/call/ring", j->a);
+
+        http_response res;
+        res.init();
+        if (!(api::call("POST", path, "{\"recipients\":null}", &res) && res.ok()))
+            record_api_error(tr("Не удалось позвонить"), &res);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    job_ids* make_ids(snowflake a, snowflake b)
+    {
+        job_ids* j = (job_ids*)memalloc(sizeof(job_ids));
+        if (j) { j->a = a; j->b = b; }
+        return j;
+    }
+
+    job_name* make_name(const char* text)
+    {
+        job_name* j = (job_name*)memalloc(sizeof(job_name));
+        if (j)
+        {
+            ccfset(j, 0, sizeof(job_name));
+            ccstrncpy(j->text, text, sizeof(j->text) - 1);
+        }
+        return j;
+    }
+}
+
+void api::fetch_messages(snowflake channel_id, snowflake before_id)
+{
+    // Nothing to ask and nobody to ask. Marked as loaded rather than left
+    // pending, so the view settles on whatever the archive gave it instead of
+    // spinning forever - and, more importantly, is never marked failed, which
+    // is a state the chat view reads as "do not bother with this channel".
+    if (offline::active())
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (ch)
+        {
+            ch->history_loading = false;
+            ch->history_failed = false;
+            ch->history_loaded = true;
+            ch->history_exhausted = true;
+        }
+        return;
+    }
+
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (!ch || ch->history_loading) return;
+        ch->history_loading = true;
+    }
+    job_ids* j = make_ids(channel_id, before_id);
+    if (j) jobs::post(job_fetch_messages, j);
+}
+
+void api::fetch_sessions()
+{
+    if (offline::active())
+    {
+        store::guard g;
+        store::set_sessions_failed();
+        return;
+    }
+
+    {
+        store::guard g;
+        if (store::sessions_state() == 1) return;   // already in flight
+        store::set_sessions_loading();
+    }
+
+    jobs::post(job_fetch_sessions, 0);
+}
+
+void api::send_message(snowflake channel_id, const char* content, snowflake reply_to)
+{
+    job_text* j = (job_text*)memalloc(sizeof(job_text));
+    if (!j) return;
+    ccfset(j, 0, sizeof(job_text));
+    j->channel_id = channel_id;
+    j->reply_to = reply_to;
+    ccstrncpy(j->text, content, sizeof(j->text) - 1);
+    jobs::post(job_send_message, j);
+}
+
+void api::send_message_with_files(snowflake channel_id, const char* content, ulist<upload_file>* files)
+{
+    job_upload* j = (job_upload*)memalloc(sizeof(job_upload));
+    if (!j) return;
+    ccfset(j, 0, sizeof(job_upload));
+    j->channel_id = channel_id;
+    if (content) ccstrncpy(j->text, content, sizeof(j->text) - 1);
+    j->files = *files;
+
+    // Ownership moved into the job.
+    files->listPTR = 0;
+    files->count = 0;
+    files->reservedCount = 0;
+
+    jobs::post(job_send_upload, j);
+}
+
+void api::fetch_user_profile(snowflake user_id, snowflake guild_id)
+{
+    job_ids* j = make_ids(user_id, guild_id);
+    if (j) jobs::post(job_fetch_profile, j);
+}
+
+void api::fetch_guild_channels(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_fetch_guild_channels, j);
+}
+
+void api::fetch_channel(snowflake channel_id)
+{
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_fetch_channel, j);
+}
+
+// One guild member by id, for places that name a person without having them
+// in the member list - a voice channel row opening a profile, for example.
+void api::fetch_guild_member(snowflake guild_id, snowflake user_id)
+{
+    job_ids* j = make_ids(guild_id, user_id);
+    if (j) jobs::post(job_fetch_guild_member, j);
+}
+
+void api::open_dm(snowflake user_id)
+{
+    job_ids* j = make_ids(user_id, 0);
+    if (j) jobs::post(job_open_dm, j);
+}
+
+namespace
+{
+    // Two short strings, for the settings and profile calls. Named apart from
+    // the message job, which already owns "job_text".
+    struct job_fields
+    {
+        char a[512];
+        char b[1024];
+    };
+
+    void job_update_settings(void* user)
+    {
+        job_fields* j = (job_fields*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("status", j->a);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+        if (!api::call("PATCH", "/users/@me/settings", w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Не удалось сменить статус"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_update_profile(void* user)
+    {
+        job_fields* j = (job_fields*)user;
+
+        // Two fields, two endpoints. The display name belongs to the account
+        // and goes to /users/@me; the biography belongs to the profile and goes
+        // to /users/@me/profile. Sending the name to the profile endpoint - as
+        // this did - is accepted with a 200 and quietly ignored, which is
+        // exactly what "renaming does nothing" looked like.
+        bool ok = true;
+
+        if (j->a[0])
+        {
+            jwriter w;
+            w.init();
+            w.begin_obj();
+            w.kv_str("global_name", j->a);
+            w.end_obj();
+
+            http_response res;
+            res.init();
+
+            if (api::call("PATCH", "/users/@me", w.buf.c_str(), &res) && res.ok())
+            {
+                jdoc doc;
+                doc.init();
+                if (doc.parse(res.text(), (int)res.body.size))
+                {
+                    store::guard g;
+                    store::upsert_user(doc.r());
+                    store::bump_revision();
+                }
+                doc.free_doc();
+            }
+            else
+            {
+                record_api_error(tr("Не удалось сменить имя"), &res);
+                ok = false;
+            }
+
+            res.free_response();
+            w.free_writer();
+        }
+
+        if (ok && j->b[0])
+        {
+            jwriter w;
+            w.init();
+            w.begin_obj();
+            w.kv_str("bio", j->b);
+            w.end_obj();
+
+            http_response res;
+            res.init();
+
+            if (!api::call("PATCH", "/users/@me/profile", w.buf.c_str(), &res) || !res.ok())
+            {
+                record_api_error(tr("Не удалось обновить профиль"), &res);
+                ok = false;
+            }
+
+            res.free_response();
+            w.free_writer();
+        }
+
+        if (ok) api::set_last_error(tr("Профиль обновлён"));
+        memfree(j);
+    }
+}
+
+namespace
+{
+    struct job_guild_image
+    {
+        snowflake guild_id;
+        wchar_t path[MAX_PATH];
+    };
+
+    struct job_name_id
+    {
+        snowflake id;
+        char text[128];
+    };
+
+    // Guessed from the extension rather than sniffed: discord only cares that
+    // the prefix matches the bytes, and every picture a person will pick here
+    // names itself honestly.
+    const char* mime_for(const wchar_t* path)
+    {
+        int last = -1;
+        for (int i = 0; path[i]; i++) if (path[i] == L'.') last = i;
+        if (last < 0) return "image/png";
+
+        wchar_t ext[8];
+        int n = 0;
+        for (int i = last + 1; path[i] && n < 7; i++)
+        {
+            wchar_t ch = path[i];
+            if (ch >= L'A' && ch <= L'Z') ch = (wchar_t)(ch - L'A' + L'a');
+            ext[n++] = ch;
+        }
+        ext[n] = 0;
+
+        if (n == 3 && ext[0] == L'g' && ext[1] == L'i' && ext[2] == L'f') return "image/gif";
+        if (n == 3 && ext[0] == L'j' && ext[1] == L'p' && ext[2] == L'g') return "image/jpeg";
+        if (n == 4 && ext[0] == L'j' && ext[1] == L'p' && ext[2] == L'e' && ext[3] == L'g') return "image/jpeg";
+        if (n == 4 && ext[0] == L'w' && ext[1] == L'e' && ext[2] == L'b' && ext[3] == L'p') return "image/webp";
+        return "image/png";
+    }
+
+    void job_guild_name(void* user)
+    {
+        job_name_id* j = (job_name_id*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->text);
+        w.end_obj();
+
+        char path[64];
+        cnprint(path, sizeof(path), "/guilds/%llu", j->id);
+
+        http_response res;
+        res.init();
+
+        // GUILD_UPDATE arrives on the gateway, so nothing is written here.
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Не удалось переименовать сервер"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_channel_name(void* user)
+    {
+        job_name_id* j = (job_name_id*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->text);
+        w.end_obj();
+
+        char path[64];
+        cnprint(path, sizeof(path), "/channels/%llu", j->id);
+
+        http_response res;
+        res.init();
+
+        // CHANNEL_UPDATE arrives on the gateway, so the store is left alone
+        // here - the same as renaming a server.
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Не удалось переименовать канал"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    struct job_slowmode
+    {
+        snowflake channel_id;
+        int seconds;
+    };
+
+    void job_channel_slowmode(void* user)
+    {
+        job_slowmode* j = (job_slowmode*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_i64("rate_limit_per_user", j->seconds);
+        w.end_obj();
+
+        char path[64];
+        cnprint(path, sizeof(path), "/channels/%llu", j->channel_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Медленный режим"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_guild_icon(void* user)
+    {
+        job_guild_image* j = (job_guild_image*)user;
+
+        char path[64];
+        cnprint(path, sizeof(path), "/guilds/%llu", j->guild_id);
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        ubuffer file;
+        ubuffer base64;
+        ubuffer uri;
+        file.init();
+        base64.init();
+        uri.init();
+
+        if (!j->path[0])
+        {
+            w.kv_null("icon");        // taking it off
+        }
+        else if (!ufile::read_all(j->path, &file) || !file.size)
+        {
+            api::set_last_error(tr("Файл не читается"));
+            w.free_writer(); file.free_buffer(); base64.free_buffer(); uri.free_buffer();
+            memfree(j);
+            return;
+        }
+        else if (file.size > 10u * 1024u * 1024u)
+        {
+            api::set_last_error(tr("Файл больше 10 МБ"));
+            w.free_writer(); file.free_buffer(); base64.free_buffer(); uri.free_buffer();
+            memfree(j);
+            return;
+        }
+        else
+        {
+            crypto::base64_encode(file.data, file.size, &base64);
+
+            uri.append("data:", 5);
+            const char* mime = mime_for(j->path);
+            uri.append(mime, (unsigned int)ccslenf(mime));
+            uri.append(";base64,", 8);
+            uri.append(base64.data, base64.size);
+            uri.c_str();
+
+            w.kv_str("icon", (const char*)uri.data);
+        }
+
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (api::call("PATCH", path, w.buf.c_str(), &res) && res.ok())
+            api::set_last_error(j->path[0] ? tr("Иконка сервера обновлена") : tr("Иконка сервера убрана"));
+        else
+            record_api_error(tr("Не удалось сменить иконку сервера"), &res);
+
+        res.free_response();
+        w.free_writer();
+        uri.free_buffer();
+        base64.free_buffer();
+        file.free_buffer();
+        memfree(j);
+    }
+
+}
+
+static void do_fetch_counts(void* user)
+{
+    snowflake guild_id = *(snowflake*)user;
+    memfree(user);
+
+    char route[96];
+    cnprint(route, sizeof(route), "/guilds/%llu?with_counts=true", guild_id);
+
+    http_response res;
+    res.init();
+
+    if (api::call("GET", route, 0, &res) && res.ok())
+    {
+        jdoc doc;
+        doc.init();
+        if (doc.parse(res.text(), (int)res.body.size))
+        {
+            store::guard guard;
+            dguild* g = store::find_guild(guild_id);
+            if (g)
+            {
+                g->approx_members = doc.r()->i32("approximate_member_count", 0);
+                g->approx_online = doc.r()->i32("approximate_presence_count", 0);
+                g->counts_at_ms = GetTickCount64();
+                store::bump_revision();
+            }
+        }
+        doc.free_doc();
+    }
+    else
+    {
+        // Not worth an error in the corner of the screen: a server that will
+        // not answer this just shows what was already known.
+        store::guard guard;
+        dguild* g = store::find_guild(guild_id);
+        if (g) g->counts_at_ms = GetTickCount64();
+    }
+
+    {
+        store::guard guard;
+        dguild* g = store::find_guild(guild_id);
+        if (g) g->counts_loading = false;
+    }
+
+    res.free_response();
+}
+
+void api::fetch_guild_counts(snowflake guild_id)
+{
+    if (!guild_id || offline::active()) return;
+
+    {
+        store::guard guard;
+        dguild* g = store::find_guild(guild_id);
+        if (!g || g->counts_loading) return;
+
+        // Five minutes is plenty: this is a number on a tooltip, not a live
+        // readout, and asking per hover would be rude to the server.
+        if (g->counts_at_ms && GetTickCount64() - g->counts_at_ms < 5 * 60 * 1000ULL) return;
+        g->counts_loading = true;
+    }
+
+    snowflake* id = (snowflake*)memalloc(sizeof(snowflake));
+    if (!id) return;
+    *id = guild_id;
+
+    jobs::post(do_fetch_counts, id);
+}
+
+void api::update_status(const char* status)
+{
+    if (!status || !status[0]) return;
+
+    job_fields* j = (job_fields*)memalloc(sizeof(job_fields));
+    if (!j) return;
+    ccfset(j, 0, sizeof(job_fields));
+    ccstrncpy(j->a, status, sizeof(j->a) - 1);
+    jobs::post(job_update_settings, j);
+}
+
+void api::update_self_profile(const char* global_name, const char* bio)
+{
+    job_fields* j = (job_fields*)memalloc(sizeof(job_fields));
+    if (!j) return;
+    ccfset(j, 0, sizeof(job_fields));
+    if (global_name) ccstrncpy(j->a, global_name, sizeof(j->a) - 1);
+    if (bio) ccstrncpy(j->b, bio, sizeof(j->b) - 1);
+    jobs::post(job_update_profile, j);
+}
+
+void api::ack_message(snowflake channel_id, snowflake message_id)
+{
+    job_ids* j = make_ids(channel_id, message_id);
+    if (j) jobs::post(ack_request, j);
+}
+
+void api::trigger_typing(snowflake channel_id)
+{
+    // Anonymous typing: with it on, nothing is ever sent, so nobody sees
+    // the other side writing. Incoming indicators are untouched.
+    if (storage::settings_get_int("anonymous_typing", 0) != 0) return;
+
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_typing, j);
+}
+
+void api::edit_message(snowflake channel_id, snowflake message_id, const char* content)
+{
+    if (!content) return;
+
+    job_edit* j = (job_edit*)memalloc(sizeof(job_edit));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel_id = channel_id;
+    j->message_id = message_id;
+    ccstrncpy(j->content, content, sizeof(j->content) - 1);
+
+    jobs::post(job_edit_message, j);
+}
+
+void api::use_component(snowflake guild_id, snowflake channel_id, snowflake message_id,
+                        snowflake application_id, int component_type,
+                        const char* custom_id, const char* const* values, int value_count,
+                        int message_flags)
+{
+    if (!channel_id || !message_id || !application_id || !custom_id)
+    {
+        // Silent here used to mean a dead button with no trace: no packet,
+        // no error, no log line. Now at least the log says which part of
+        // the address was missing.
+        log_line("interaction: кнопка без адреса (канал %llu, сообщение %llu, приложение %llu)",
+                 channel_id, message_id, application_id);
+        return;
+    }
+
+    interact_args* j = (interact_args*)memalloc(sizeof(interact_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+    j->channel_id = channel_id;
+    j->message_id = message_id;
+    j->application_id = application_id;
+    j->component_type = component_type;
+    j->message_flags = message_flags;
+    ccstrncpy(j->custom_id, custom_id, sizeof(j->custom_id) - 1);
+
+    for (int i = 0; i < value_count && j->value_count < 8; i++)
+    {
+        if (!values[i]) continue;
+        ccstrncpy(j->values[j->value_count], values[i], 99);
+        j->value_count++;
+    }
+
+    jobs::post(job_interact, j);
+}
+
+bool api::take_pending_modal(api::modal_form* out)
+{
+    if (!out) return false;
+
+    EnterCriticalSection(&g_modal_lock);
+    bool got = g_modal_ready;
+    if (got)
+    {
+        *out = g_pending_modal;
+        g_modal_ready = false;
+    }
+    LeaveCriticalSection(&g_modal_lock);
+    return got;
+}
+
+void api::submit_modal(const api::modal_form* form)
+{
+    if (!form || !form->field_count) return;
+
+    modal_submit_args* j = (modal_submit_args*)memalloc(sizeof(modal_submit_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->form = *form;
+
+    jobs::post(job_modal_submit, j);
+}
+
+void api::handle_modal_dispatch(const jval* d)
+{
+    if (!d || d->type != JTYPE_OBJ) return;
+
+    // Not our click, not our popup.
+    if (!claim_modal_nonce(d->str("nonce", 0))) return;
+
+    snowflake channel_id = d->sf("channel_id");
+    snowflake application_id = d->obj("application")->sf("id");
+    snowflake guild_id = d->sf("guild_id");
+
+    if (!guild_id && channel_id)
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (ch) guild_id = ch->guild_id;
+    }
+
+    api::modal_form form;
+    if (!parse_modal_response(d, &form, guild_id, channel_id, application_id))
+    {
+        log_line("interaction: чужую форму с gateway разобрать не вышло");
+        return;
+    }
+
+    stash_modal(&form);
+    log_line("interaction: форма \"%s\" с gateway, полей %d", form.title, form.field_count);
+}
+
+int api::gap_status(snowflake channel_id, snowflake after_id)
+{
+    gap_lock_ready();
+
+    EnterCriticalSection(&g_gap_lock);
+    gap_note* n = gap_find(channel_id, after_id);
+    int state = n ? n->state : (int)GAP_UNKNOWN;
+    LeaveCriticalSection(&g_gap_lock);
+
+    return state;
+}
+
+void api::check_gap(snowflake channel_id, snowflake after_id, snowflake until_id)
+{
+    if (!channel_id || !after_id || !until_id || offline::active()) return;
+
+    gap_lock_ready();
+
+    // A few at a time. These are cheap, but a channel scrolled quickly can put
+    // a dozen boundaries on screen at once and they are not urgent.
+    if (g_gap_checks >= 3) return;
+
+    EnterCriticalSection(&g_gap_lock);
+
+    gap_note* n = gap_find(channel_id, after_id);
+    bool go = !n || n->state == GAP_UNKNOWN;
+
+    if (go) gap_set(channel_id, after_id, GAP_CHECKING);
+
+    LeaveCriticalSection(&g_gap_lock);
+
+    if (!go) return;
+
+    job_after* j = (job_after*)memalloc(sizeof(job_after));
+    if (!j) return;
+
+    j->channel = channel_id;
+    j->after = after_id;
+    j->until = until_id;
+
+    InterlockedIncrement(&g_gap_checks);
+    jobs::post(job_check_gap, j);
+}
+
+void api::fetch_messages_after(snowflake channel_id, snowflake after_id, snowflake until_id,
+                               int budget)
+{
+    if (!channel_id || !after_id || offline::active()) return;
+
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (!ch || ch->history_loading) return;
+        ch->history_loading = true;
+    }
+
+    job_after* j = (job_after*)memalloc(sizeof(job_after));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel = channel_id;
+    j->after = after_id;
+    j->until = until_id;
+    j->budget = budget;
+
+    jobs::post(job_fetch_after, j);
+}
+
+bool api::fill_progress(snowflake channel_id, int* fetched, int* wanted)
+{
+    if (!channel_id || !g_fill_active || g_fill_channel != channel_id) return false;
+    if (fetched) *fetched = (int)g_fill_fetched;
+    if (wanted) *wanted = (int)g_fill_wanted;
+    return true;
+}
+
+void api::fetch_gap_backward(snowflake channel_id, snowflake before_id, snowflake stop_id,
+                             int budget)
+{
+    if (!channel_id || !before_id || offline::active()) return;
+
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (!ch || ch->history_loading) return;
+        ch->history_loading = true;
+    }
+
+    job_gap_back* j = (job_gap_back*)memalloc(sizeof(job_gap_back));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel = channel_id;
+    j->before = before_id;
+    j->stop = stop_id;
+    j->budget = budget;
+
+    jobs::post(job_fetch_gap_before, j);
+}
+
+void api::delete_message(snowflake channel_id, snowflake message_id)
+{
+    job_ids* j = make_ids(channel_id, message_id);
+    if (j) jobs::post(job_delete_message, j);
+}
+
+void api::ring_call(snowflake channel_id)
+{
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_ring, j);
+}
+
+void api::send_friend_request(const char* username, const char* captcha_key,
+                              const char* captcha_rqtoken, const char* note)
+{
+    if (!username || !username[0]) return;
+
+    job_friend* j = (job_friend*)memalloc(sizeof(job_friend));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->name, username, sizeof(j->name) - 1);
+    if (captcha_key) ccstrncpy(j->captcha_key, captcha_key, sizeof(j->captcha_key) - 1);
+    if (captcha_rqtoken)
+        ccstrncpy(j->captcha_rqtoken, captcha_rqtoken, sizeof(j->captcha_rqtoken) - 1);
+    if (note) ccstrncpy(j->note, note, sizeof(j->note) - 1);
+
+    jobs::post(job_friend_by_name, j);
+}
+
+namespace
+{
+    struct job_login_text
+    {
+        char login[128];
+        char password[256];
+        bool undelete;
+    };
+
+    struct job_login_code
+    {
+        char code[32];
+        int method;   // 0 totp, 1 sms, 2 backup
+    };
+
+    struct job_forgot_text
+    {
+        char login[128];
+    };
+
+    struct job_new_password
+    {
+        char old_pw[256];
+        char new_pw[256];
+    };
+
+    char g_login_ticket[256];
+    bool g_login_totp = false;
+    bool g_login_sms = false;
+    bool g_login_backup = false;
+
+    // The outcome slot mirrors api::login_outcome; have lives beside it
+    // because the interface struct carries no consumption mark.
+    api::login_outcome g_login_outcome;
+    bool g_login_outcome_have = false;
+    struct simple_slot
+    {
+        bool have;
+        bool ok;
+        char text[256];
+    };
+    simple_slot g_forgot_outcome;
+
+    struct password_slot
+    {
+        bool have;
+        bool ok;
+        char token[512];
+        char error[256];
+    };
+    password_slot g_password_outcome;
+
+    bool g_sms_sent = false;
+
+    void login_outcome_fail(const char* error)
+    {
+        g_login_outcome_have = true;
+        store::bump_revision();
+        g_login_outcome.ok = false;
+        g_login_outcome.need_mfa = false;
+        g_login_outcome.need_email_check = false;
+        g_login_outcome.need_undelete = false;
+        g_login_outcome.token[0] = 0;
+        ccstrncpy(g_login_outcome.error, error ? error : "",
+                  sizeof(g_login_outcome.error) - 1);
+        store::bump_revision();
+    }
+
+    // First code out of errors.<field>._errors[0].code, or null.
+    const char* login_form_code(const jval* root, const char* field)
+    {
+        if (!root || root->type != JTYPE_OBJ || !field) return 0;
+        const jval* errors = root->obj("errors");
+        if (!errors || errors->type != JTYPE_OBJ) return 0;
+        const jval* one = errors->obj(field);
+        if (!one || one->type != JTYPE_OBJ) return 0;
+        const jval* list = one->arr("_errors");
+        if (!list || !list->count) return 0;
+        return list->at(0)->str("code", 0);
+    }
+
+    // Maps a refused login to the outcome. Captcha leftovers mean the
+    // solve was cancelled: the demand itself is the message.
+    void login_outcome_from_400(const jval* root, int status)
+    {
+        if (root && (root->has("captcha_sitekey") || root->has("captcha_key")))
+        {
+            login_outcome_fail(tr("Капча не решена"));
+            return;
+        }
+
+        // Scheduled for deletion: a top-level code, no errors object. The
+        // same request with undelete cancels it.
+        if (root && root->i64("code", 0) == 20011)
+        {
+            g_login_outcome_have = true;
+            store::bump_revision();
+            g_login_outcome.ok = false;
+            g_login_outcome.need_mfa = false;
+            g_login_outcome.need_email_check = false;
+            g_login_outcome.need_undelete = true;
+            g_login_outcome.token[0] = 0;
+            ccstrncpy(g_login_outcome.error, tr("Аккаунт запланирован к удалению"),
+                      sizeof(g_login_outcome.error) - 1);
+            return;
+        }
+
+        const char* code = login_form_code(root, "login");
+        if (code && ccscmp(code, "ACCOUNT_LOGIN_VERIFICATION_EMAIL") == 0)
+        {
+            g_login_outcome_have = true;
+            store::bump_revision();
+            g_login_outcome.ok = false;
+            g_login_outcome.need_mfa = false;
+            g_login_outcome.need_email_check = true;
+            g_login_outcome.need_undelete = false;
+            g_login_outcome.token[0] = 0;
+            ccstrncpy(g_login_outcome.error, tr("Новое место входа: проверь почту и повтори"),
+                      sizeof(g_login_outcome.error) - 1);
+            return;
+        }
+
+        if (code && ccscmp(code, "INVALID_LOGIN") == 0)
+        {
+            login_outcome_fail(tr("Логин или пароль неверны"));
+            return;
+        }
+
+        const char* detail = root ? root->str("message", 0) : 0;
+        if (detail && detail[0])
+        {
+            login_outcome_fail(detail);
+            return;
+        }
+
+        char fallback[96];
+        cnprint(fallback, sizeof(fallback), tr("Не удалось войти (HTTP %d)"), status);
+        login_outcome_fail(fallback);
+    }
+
+    void job_login_password(void* user)
+    {
+        job_login_text* j = (job_login_text*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("login", j->login);
+        w.kv_str("password", j->password);
+        w.kv_bool("undelete", j->undelete);
+        w.kv_null("login_source");
+        w.kv_null("gift_code_sku_id");
+        w.end_obj();
+
+        ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
+        g_login_totp = g_login_sms = g_login_backup = false;
+        g_sms_sent = false;
+
+        http_response res;
+        res.init();
+
+        bool answered = call_captcha_aware("POST", "/auth/login", w.c_str(), &res,
+                                           0, tr("Вход в аккаунт"), 0);
+        w.free_writer();
+
+        if (answered && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) &&
+                doc.root && doc.root->type == JTYPE_OBJ)
+            {
+                const char* token = doc.root->str("token", 0);
+                if (token && token[0])
+                {
+                    g_login_outcome_have = true;
+                    store::bump_revision();
+                    g_login_outcome.ok = true;
+                    g_login_outcome.need_mfa = false;
+                    g_login_outcome.need_email_check = false;
+                    g_login_outcome.need_undelete = false;
+                    ccstrncpy(g_login_outcome.token, token, sizeof(g_login_outcome.token) - 1);
+                    g_login_outcome.error[0] = 0;
+                    log_line("login: токен получен");
+                }
+                else if (doc.root->boolean("mfa", false))
+                {
+                    const char* ticket = doc.root->str("ticket", 0);
+                    if (ticket) ccstrncpy(g_login_ticket, ticket, sizeof(g_login_ticket) - 1);
+                    g_login_totp = doc.root->boolean("totp", false);
+                    g_login_sms = doc.root->boolean("sms", false);
+                    g_login_backup = doc.root->boolean("backup", false);
+
+                    g_login_outcome_have = true;
+                    store::bump_revision();
+                    g_login_outcome.ok = false;
+                    g_login_outcome.need_mfa = g_login_ticket[0] != 0;
+                    g_login_outcome.need_email_check = false;
+                    g_login_outcome.need_undelete = false;
+                    g_login_outcome.token[0] = 0;
+                    if (!g_login_outcome.need_mfa)
+                        ccstrncpy(g_login_outcome.error, tr("Двухфакторка без кода из письма"),
+                                  sizeof(g_login_outcome.error) - 1);
+                    else
+                        g_login_outcome.error[0] = 0;
+                    log_line("login: нужна двухфакторка");
+                }
+                else
+                {
+                    login_outcome_fail(tr("Неожиданный ответ сервера"));
+                }
+            }
+            else
+            {
+                login_outcome_fail(tr("Неожиданный ответ сервера"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                login_outcome_from_400(doc.root, res.status);
+            else if (res.status == 0)
+                login_outcome_fail(tr("Нет соединения с discord.com"));
+            else
+                login_outcome_fail(tr("Не удалось войти"));
+            doc.free_doc();
+        }
+
+        res.free_response();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    const char* mfa_endpoint(int method)
+    {
+        if (method == 1) return "/auth/mfa/sms";
+        if (method == 2) return "/auth/mfa/backup";
+        return "/auth/mfa/totp";
+    }
+
+    void job_login_mfa(void* user)
+    {
+        job_login_code* j = (job_login_code*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("code", j->code);
+        w.kv_str("ticket", g_login_ticket);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        bool answered = call_captcha_aware("POST", mfa_endpoint(j->method), w.c_str(),
+                                           &res, 0, tr("Двухфакторка"), 0);
+        w.free_writer();
+
+        if (answered && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            if (token && token[0])
+            {
+                g_login_outcome_have = true;
+                store::bump_revision();
+                g_login_outcome.ok = true;
+                g_login_outcome.need_mfa = false;
+                g_login_outcome.need_email_check = false;
+                g_login_outcome.need_undelete = false;
+                ccstrncpy(g_login_outcome.token, token, sizeof(g_login_outcome.token) - 1);
+                g_login_outcome.error[0] = 0;
+                ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
+                log_line("login: двухфакторка пройдена");
+            }
+            else
+            {
+                login_outcome_fail(tr("Неожиданный ответ сервера"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+            const char* code = parsed ? login_form_code(doc.root, "code") : 0;
+            // A wrong code invalidates nothing: the ticket stays, the code
+            // can be retyped. Anything else drops the attempt.
+            if (code && ccscmp(code, "INVALID_CODE") == 0)
+            {
+                login_outcome_fail(tr("Неверный код"));
+                g_login_outcome.need_mfa = g_login_ticket[0] != 0;
+            }
+            else if (parsed)
+            {
+                login_outcome_from_400(doc.root, res.status);
+            }
+            else
+            {
+                login_outcome_fail(tr("Не удалось проверить код"));
+            }
+            doc.free_doc();
+        }
+
+        res.free_response();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_login_mfa_sms(void* user)
+    {
+        (void)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("ticket", g_login_ticket);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/auth/mfa/sms/send", w.c_str(), &res,
+                               0, tr("Двухфакторка"), 0) && res.ok())
+        {
+            g_sms_sent = true;
+            store::bump_revision();
+            log_line("login: SMS-код запрошен");
+        }
+        else
+        {
+            login_outcome_fail(tr("Не удалось запросить SMS-код"));
+        }
+        w.free_writer();
+
+        res.free_response();
+    }
+
+    void job_login_forgot(void* user)
+    {
+        job_forgot_text* j = (job_forgot_text*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("login", j->login);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/auth/forgot", w.c_str(), &res,
+                               0, tr("Восстановление доступа"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* method = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                method = doc.root->str("method", 0);
+
+            g_forgot_outcome.have = true;
+            store::bump_revision();
+            g_forgot_outcome.ok = true;
+            if (method && method[0])
+                ccstrncpy(g_forgot_outcome.text, method, sizeof(g_forgot_outcome.text) - 1);
+            else
+                g_forgot_outcome.text[0] = 0;
+            log_line("login: письмо для восстановления отправлено");
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            g_forgot_outcome.have = true;
+            store::bump_revision();
+            g_forgot_outcome.ok = false;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* detail = doc.root->str("message", 0);
+                if (detail && detail[0])
+                    ccstrncpy(g_forgot_outcome.text, detail, sizeof(g_forgot_outcome.text) - 1);
+                else
+                    ccstrncpy(g_forgot_outcome.text, tr("Не удалось отправить письмо"),
+                              sizeof(g_forgot_outcome.text) - 1);
+            }
+            else
+            {
+                ccstrncpy(g_forgot_outcome.text, tr("Не удалось отправить письмо"),
+                          sizeof(g_forgot_outcome.text) - 1);
+            }
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_change_password(void* user)
+    {
+        job_new_password* j = (job_new_password*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("password", j->old_pw);
+        w.kv_str("new_password", j->new_pw);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена пароля"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            g_password_outcome.have = true;
+            store::bump_revision();
+            if (token && token[0])
+            {
+                g_password_outcome.ok = true;
+                ccstrncpy(g_password_outcome.token, token,
+                          sizeof(g_password_outcome.token) - 1);
+                g_password_outcome.error[0] = 0;
+                log_line("password: сменён, токен обновлён");
+            }
+            else
+            {
+                g_password_outcome.ok = false;
+                g_password_outcome.token[0] = 0;
+                ccstrncpy(g_password_outcome.error, tr("Неожиданный ответ сервера"),
+                          sizeof(g_password_outcome.error) - 1);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            g_password_outcome.have = true;
+            store::bump_revision();
+            g_password_outcome.ok = false;
+            g_password_outcome.token[0] = 0;
+
+            bool mapped = false;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* code = login_form_code(doc.root, "password");
+                if (!code) code = login_form_code(doc.root, "new_password");
+
+                if (code && ccscmp(code, "PASSWORD_DOES_NOT_MATCH") == 0)
+                {
+                    ccstrncpy(g_password_outcome.error, tr("Текущий пароль неверный"),
+                              sizeof(g_password_outcome.error) - 1);
+                    mapped = true;
+                }
+                else if (code && ccscmp(code, "BASE_TYPE_MIN_LENGTH") == 0)
+                {
+                    ccstrncpy(g_password_outcome.error, tr("Новый пароль слишком короткий"),
+                              sizeof(g_password_outcome.error) - 1);
+                    mapped = true;
+                }
+                else
+                {
+                    const char* detail = doc.root->str("message", 0);
+                    if (detail && detail[0])
+                    {
+                        ccstrncpy(g_password_outcome.error, detail,
+                                  sizeof(g_password_outcome.error) - 1);
+                        mapped = true;
+                    }
+                }
+            }
+            if (!mapped)
+            {
+                ccstrncpy(g_password_outcome.error, tr("Не удалось сменить пароль"),
+                          sizeof(g_password_outcome.error) - 1);
+            }
+            doc.free_doc();
+
+            record_api_error(tr("Смена пароля"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+}
+
+const char* api::heartbeat_session_id() { return g_heartbeat_session; }
+const char* api::launch_signature() { return g_launch_signature; }
+
+const char* api::captcha_sitekey() { return g_captcha_sitekey; }
+const char* api::captcha_rqtoken() { return g_captcha_rqtoken; }
+const char* api::captcha_session() { return g_captcha_session; }
+
+void api::clear_captcha()
+{
+    ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
+    ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
+    ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
+}
+
+void api::login_password(const char* login, const char* password, bool undelete)
+{
+    if (offline::active())
+    {
+        login_outcome_fail(tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!login || !login[0] || !password || !password[0]) return;
+
+    // A fresh attempt drops the previous challenge at once, so the form
+    // below does not offer a code for it while the request is in flight.
+    ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
+    g_login_totp = g_login_sms = g_login_backup = false;
+    g_sms_sent = false;
+    g_login_outcome_have = false;
+
+    job_login_text* j = (job_login_text*)memalloc(sizeof(job_login_text));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->login, login, sizeof(j->login) - 1);
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+    j->undelete = undelete;
+
+    jobs::post(job_login_password, j);
+}
+
+bool api::login_mfa_pending(login_mfa_methods* out)
+{
+    if (!g_login_ticket[0]) return false;
+    if (out)
+    {
+        out->totp = g_login_totp;
+        out->sms = g_login_sms;
+        out->backup = g_login_backup;
+    }
+    return true;
+}
+
+void api::login_mfa(const char* code, int method)
+{
+    if (offline::active())
+    {
+        login_outcome_fail(tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!code || !code[0] || !g_login_ticket[0]) return;
+    if (method == 1 && !g_login_sms) return;
+    if (method == 2 && !g_login_backup) return;
+    if (method != 1 && method != 2 && !g_login_totp) return;
+
+    job_login_code* j = (job_login_code*)memalloc(sizeof(job_login_code));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->code, code, sizeof(j->code) - 1);
+    j->method = method;
+
+    g_login_outcome_have = false;
+    jobs::post(job_login_mfa, j);
+}
+
+void api::login_mfa_send_sms()
+{
+    if (offline::active() || !g_login_ticket[0] || !g_login_sms) return;
+    g_sms_sent = false;
+    jobs::post(job_login_mfa_sms, 0);
+}
+
+bool api::take_login_sms_sent()
+{
+    if (!g_sms_sent) return false;
+    g_sms_sent = false;
+    return true;
+}
+
+bool api::take_login_result(login_outcome* out)
+{
+    if (!g_login_outcome_have || !out) return false;
+    *out = g_login_outcome;
+    g_login_outcome_have = false;
+    return true;
+}
+
+void api::login_forgot(const char* login)
+{
+    if (offline::active())
+    {
+        g_forgot_outcome.have = true;
+        store::bump_revision();
+        g_forgot_outcome.ok = false;
+        ccstrncpy(g_forgot_outcome.text, tr("Нет соединения с discord.com"),
+                  sizeof(g_forgot_outcome.text) - 1);
+        return;
+    }
+    if (!login || !login[0]) return;
+
+    job_forgot_text* j = (job_forgot_text*)memalloc(sizeof(job_forgot_text));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->login, login, sizeof(j->login) - 1);
+
+    g_forgot_outcome.have = false;
+    jobs::post(job_login_forgot, j);
+}
+
+bool api::take_forgot_result(bool* ok, char* info, int info_cap)
+{
+    if (!g_forgot_outcome.have) return false;
+    if (ok) *ok = g_forgot_outcome.ok;
+    if (info && info_cap > 0)
+        ccstrncpy(info, g_forgot_outcome.text, info_cap - 1);
+    g_forgot_outcome.have = false;
+    return true;
+}
+
+void api::change_password(const char* old_password, const char* new_password)
+{
+    if (offline::active())
+    {
+        g_password_outcome.have = true;
+        store::bump_revision();
+        g_password_outcome.ok = false;
+        g_password_outcome.token[0] = 0;
+        ccstrncpy(g_password_outcome.error, tr("Нет соединения с discord.com"),
+                  sizeof(g_password_outcome.error) - 1);
+        return;
+    }
+    if (!old_password || !old_password[0] || !new_password || !new_password[0]) return;
+
+    job_new_password* j = (job_new_password*)memalloc(sizeof(job_new_password));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->old_pw, old_password, sizeof(j->old_pw) - 1);
+    ccstrncpy(j->new_pw, new_password, sizeof(j->new_pw) - 1);
+
+    g_password_outcome.have = false;
+    jobs::post(job_change_password, j);
+}
+
+bool api::take_password_result(bool* ok, char* token_out, int token_cap,
+                               char* error, int error_cap)
+{
+    if (!g_password_outcome.have) return false;
+    if (ok) *ok = g_password_outcome.ok;
+    if (token_out && token_cap > 0)
+        ccstrncpy(token_out, g_password_outcome.token, token_cap - 1);
+    if (error && error_cap > 0)
+        ccstrncpy(error, g_password_outcome.error, error_cap - 1);
+    g_password_outcome.have = false;
+    return true;
+}
+
+
+void api::accept_friend_request(snowflake user_id, bool confirm)
+{
+    job_ids* j = make_ids(user_id, confirm ? 1 : 0);
+    if (j) jobs::post(job_simple_put_relationship, j);
+}
+
+namespace
+{
+    struct op_slot
+    {
+        bool have;
+        bool ok;
+        char error[256];
+    };
+
+    void op_fail(op_slot* slot, const char* error)
+    {
+        slot->have = true;
+        slot->ok = false;
+        ccstrncpy(slot->error, error ? error : "", sizeof(slot->error) - 1);
+        // Outcomes are consumed by polling: without this the frame that
+        // would pick one up never comes, and the spinner waits forever.
+        store::bump_revision();
+    }
+
+    void op_done(op_slot* slot)
+    {
+        slot->have = true;
+        slot->ok = true;
+        slot->error[0] = 0;
+        store::bump_revision();
+    }
+
+    bool op_take(op_slot* slot, bool* ok, char* error, int error_cap)
+    {
+        if (!slot->have) return false;
+        if (ok) *ok = slot->ok;
+        if (error && error_cap > 0)
+            ccstrncpy(error, slot->error, error_cap - 1);
+        slot->have = false;
+        return true;
+    }
+
+    // Server detail or a fallback, for small flows that only show text.
+    void op_fail_detail(op_slot* slot, const jval* root, const char* fallback)
+    {
+        const char* detail = (root && root->type == JTYPE_OBJ) ? root->str("message", 0) : 0;
+
+        // Discord localises the body by the client's locale, so the same
+        // refusal arrives in German for one person and English for another.
+        // The rate limit in particular is worth a sentence that can be acted
+        // on rather than "Die Ressourcenrate wird begrenzt.".
+        if (detail && (ccscmp(detail, "Die Ressourcenrate wird begrenzt.") == 0 ||
+                       ccscmp(detail, "You are being rate limited.") == 0))
+            detail = tr("Слишком много запросов, попробуй позже");
+        else if (detail && ccscmp(detail, "Verifizierungscode ist ungültig.") == 0)
+            detail = tr("Неверный код, попробуй ещё");
+
+        if (detail && detail[0]) op_fail(slot, detail);
+        else op_fail(slot, fallback);
+    }
+
+    // A 429 carries how long to wait, and saying it saves the person from
+    // hammering the button to find out.
+    void op_fail_rate_limit(op_slot* slot, const http_response* res)
+    {
+        int secs = res ? (res->retry_after_ms + 999) / 1000 : 0;
+        if (secs <= 0)
+        {
+            op_fail(slot, tr("Слишком много запросов, попробуй позже"));
+            return;
+        }
+
+        char text[128];
+        cnprint(text, sizeof(text), tr("Слишком много запросов, подожди %d с"), secs);
+        op_fail(slot, text);
+    }
+
+    op_slot g_email_code;
+    op_slot g_email_verify;
+    op_slot g_email_apply;
+    op_slot g_phone_code;
+    op_slot g_phone_verify;
+    op_slot g_phone_apply;
+    op_slot g_profile_outcome;
+    op_slot g_account_outcome;
+    op_slot g_delete_outcome;
+
+    struct username_slot
+    {
+        bool have;
+        bool taken;
+        char error[128];
+    };
+    username_slot g_username_check;
+
+    // The token step 2 returns: step 3 carries it, nothing else does.
+    char g_email_token[2048];
+    char g_phone_token[2048];
+
+    struct avatar_entry
+    {
+        char id[32];
+        char hash[64];
+        char desc[128];
+    };
+    avatar_entry g_avatar_list[24];
+    int g_avatar_count = 0;
+    volatile long g_avatars_busy = 0;
+    bool g_avatars_failed = false;
+
+    struct job_email_code
+    {
+        char code[16];
+    };
+
+    struct job_email_run
+    {
+        char email[128];
+        char password[256];
+    };
+
+    struct job_phone_send_args
+    {
+        char phone[32];
+    };
+
+    struct job_phone_verify_args
+    {
+        char phone[32];
+        char code[16];
+    };
+
+    struct job_phone_apply_args
+    {
+        char password[256];
+    };
+
+    struct job_profile_text
+    {
+        char bio[512];
+        bool has_bio;
+        char pronouns[64];
+        bool has_pronouns;
+        char* banner;
+        bool remove_banner;
+    };
+
+    struct job_account_display
+    {
+        char name[64];
+        bool has_name;
+        // Exactly one of these: a data:image/...;base64 upload, or a
+        // history id to restore.
+        char* avatar_data;
+        char avatar_id[32];
+    };
+
+    struct job_username_new
+    {
+        char username[64];
+        char password[256];
+    };
+
+    struct job_username_ask
+    {
+        char username[64];
+    };
+
+    struct job_delete_args
+    {
+        char password[256];
+    };
+
+    void refresh_self(const jval* root)
+    {
+        if (!root || root->type != JTYPE_OBJ) return;
+        store::guard g;
+        store::upsert_user(root);
+        store::bump_revision();
+    }
+
+    // Phone attachment answers 204, so the number itself has to be read back
+    // from the account rather than taken from the request.
+    void refresh_self_live()
+    {
+        http_response res;
+        res.init();
+
+        if (api::call("GET", "/users/@me", 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+        }
+
+        res.free_response();
+    }
+
+    void job_email_send_code(void* user)
+    {
+        (void)user;
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PUT", "/users/@me/email", 0, &res,
+                               0, tr("Смена почты"), 0) && res.ok())
+        {
+            op_done(&g_email_code);
+            log_line("email: код запрошен");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_email_code, doc.root, tr("Не удалось запросить код"));
+            else
+                op_fail(&g_email_code, tr("Не удалось запросить код"));
+            doc.free_doc();
+        }
+
+        res.free_response();
+    }
+
+    void job_email_verify_code(void* user)
+    {
+        job_email_code* j = (job_email_code*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("code", j->code);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/email/verify-code", w.c_str(),
+                               &res, 0, tr("Смена почты"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            if (token && token[0])
+            {
+                ccstrncpy(g_email_token, token, sizeof(g_email_token) - 1);
+                op_done(&g_email_verify);
+                log_line("email: код принят");
+            }
+            else
+            {
+                op_fail(&g_email_verify, tr("Неожиданный ответ сервера"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* code = login_form_code(doc.root, "code");
+                if (code && ccscmp(code, "CODE_INVALID") == 0)
+                    op_fail(&g_email_verify, tr("Неверный код, попробуй ещё"));
+                else if (code && ccscmp(code, "BASE_TYPE_MAX_LENGTH") == 0)
+                    op_fail(&g_email_verify, tr("Код — не больше 6 символов"));
+                else
+                    op_fail_detail(&g_email_verify, doc.root, tr("Код не принят"));
+            }
+            else
+            {
+                op_fail(&g_email_verify, tr("Код не принят"));
+            }
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_email_apply(void* user)
+    {
+        job_email_run* j = (job_email_run*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("email", j->email);
+        w.kv_str("email_token", g_email_token);
+        w.kv_str("password", j->password);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена почты"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+
+            ccfset(g_email_token, 0, sizeof(g_email_token));
+            op_done(&g_email_apply);
+            log_line("email: смена подтверждена, ждёт письма на новую почту");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_email_apply, doc.root, tr("Почта не сменена"));
+            else
+                op_fail(&g_email_apply, tr("Почта не сменена"));
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_phone_send_code(void* user)
+    {
+        job_phone_send_args* j = (job_phone_send_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("phone", j->phone);
+        w.kv_str("change_phone_reason", "user_settings_update");
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/phone", w.c_str(), &res,
+                               0, tr("Телефон"), 0) && res.ok())
+        {
+            op_done(&g_phone_code);
+            log_line("phone: код запрошен");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+
+            if (res.status == 429) op_fail_rate_limit(&g_phone_code, &res);
+            else op_fail_detail(&g_phone_code, parsed ? doc.root : 0,
+                                tr("Не удалось отправить код"));
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_phone_verify_code(void* user)
+    {
+        job_phone_verify_args* j = (job_phone_verify_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("phone", j->phone);
+        w.kv_str("code", j->code);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/phone-verifications/verify", w.c_str(),
+                               &res, 0, tr("Телефон"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            if (token && token[0])
+            {
+                ccstrncpy(g_phone_token, token, sizeof(g_phone_token) - 1);
+                op_done(&g_phone_verify);
+                log_line("phone: код принят");
+            }
+            else
+            {
+                op_fail(&g_phone_verify, tr("Неожиданный ответ сервера"));
+            }
+
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+            int code = parsed ? doc.root->i32("code", 0) : 0;
+
+            if (res.status == 429) op_fail_rate_limit(&g_phone_verify, &res);
+            else if (code == 50037) op_fail(&g_phone_verify, tr("Неверный код, попробуй ещё"));
+            else op_fail_detail(&g_phone_verify, parsed ? doc.root : 0,
+                                tr("Не удалось подтвердить номер"));
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_phone_apply_number(void* user)
+    {
+        job_phone_apply_args* j = (job_phone_apply_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("phone_token", g_phone_token);
+        w.kv_str("password", j->password);
+        w.kv_str("change_phone_reason", "user_settings_update");
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/phone", w.c_str(), &res,
+                               0, tr("Телефон"), 0) && res.ok())
+        {
+            ccfset(g_phone_token, 0, sizeof(g_phone_token));
+            refresh_self_live();
+            op_done(&g_phone_apply);
+            log_line("phone: номер привязан");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+
+            if (res.status == 429) op_fail_rate_limit(&g_phone_apply, &res);
+            else op_fail_detail(&g_phone_apply, parsed ? doc.root : 0,
+                                tr("Номер не привязан"));
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_profile_patch(void* user)
+    {
+        job_profile_text* j = (job_profile_text*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        if (j->has_bio) w.kv_str("bio", j->bio);
+        if (j->has_pronouns) w.kv_str("pronouns", j->pronouns);
+        if (j->banner) w.kv_str("banner", j->banner);
+        else if (j->remove_banner) w.kv_null("banner");
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/%40me/profile", w.c_str(), &res,
+                               0, tr("Смена профиля"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                // The answer is shaped like the profile, not like a user:
+                // fold what it says into the owner's object by hand.
+                store::guard g;
+                duser* me = store::self();
+                if (me)
+                {
+                    if (doc.root->has("bio"))
+                        me->bio = store::intern(doc.root->str("bio", ""));
+                    if (doc.root->has("pronouns"))
+                        me->pronouns = store::intern(doc.root->str("pronouns", ""));
+                    if (doc.root->has("banner"))
+                    {
+                        const char* banner = doc.root->str("banner", 0);
+                        me->banner = banner ? store::intern(banner) : 0;
+                    }
+                    else if (j->remove_banner)
+                    {
+                        me->banner = 0;
+                    }
+                }
+                store::bump_revision();
+            }
+            doc.free_doc();
+
+            op_done(&g_profile_outcome);
+            log_line("profile: описание/местоимения/баннер сохранены");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_profile_outcome, doc.root, tr("Профиль не сохранён"));
+            else
+                op_fail(&g_profile_outcome, tr("Профиль не сохранён"));
+            doc.free_doc();
+
+            record_api_error(tr("Смена профиля"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        if (j->banner) memfree(j->banner);
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_update_account_display(void* user)
+    {
+        job_account_display* j = (job_account_display*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        if (j->has_name) w.kv_str("global_name", j->name);
+        if (j->avatar_data) w.kv_str("avatar", j->avatar_data);
+        else if (j->avatar_id[0]) w.kv_str("avatar_id", j->avatar_id);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена профиля"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+
+            op_done(&g_account_outcome);
+            log_line("profile: ник/аватарка сохранены");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_account_outcome, doc.root, tr("Ник/аватарка не сохранены"));
+            else
+                op_fail(&g_account_outcome, tr("Ник/аватарка не сохранены"));
+            doc.free_doc();
+
+            record_api_error(tr("Смена ника/аватарки"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        if (j->avatar_data) memfree(j->avatar_data);
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_username_probe(void* user)
+    {
+        job_username_ask* j = (job_username_ask*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("username", j->username);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/pomelo-attempt", w.c_str(),
+                               &res, 0, tr("Проверка юзернейма"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            g_username_check.have = true;
+            store::bump_revision();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                g_username_check.taken = doc.root->boolean("taken", false);
+                g_username_check.error[0] = 0;
+            }
+            else
+            {
+                g_username_check.taken = false;
+                ccstrncpy(g_username_check.error, tr("Неожиданный ответ сервера"),
+                          sizeof(g_username_check.error) - 1);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            g_username_check.have = true;
+            store::bump_revision();
+            g_username_check.taken = false;
+            ccstrncpy(g_username_check.error, tr("Не удалось проверить юзернейм"),
+                      sizeof(g_username_check.error) - 1);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_username_set(void* user)
+    {
+        job_username_new* j = (job_username_new*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("username", j->username);
+        w.kv_str("password", j->password);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена юзернейма"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+
+            op_done(&g_account_outcome);
+            log_line("profile: юзернейм сменён");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_account_outcome, doc.root, tr("Юзернейм не сменён"));
+            else
+                op_fail(&g_account_outcome, tr("Юзернейм не сменён"));
+            doc.free_doc();
+
+            record_api_error(tr("Смена юзернейма"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_delete_account(void* user)
+    {
+        job_delete_args* j = (job_delete_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("password", j->password);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        // One request, no confirmation round-trip: 204 with an empty body
+        // means the account is gone and the token died with it.
+        if (call_captcha_aware("POST", "/users/@me/delete", w.c_str(), &res,
+                               0, tr("Удаление аккаунта"), 0) && res.ok())
+        {
+            op_done(&g_delete_outcome);
+            log_line("account: удалён");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool mapped = false;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                // Wrong password comes back as a bare code, no errors object.
+                long long code = doc.root->i64("code", 0);
+                if (code == 50018)
+                {
+                    op_fail(&g_delete_outcome, tr("Пароль неверный"));
+                    mapped = true;
+                }
+                else
+                {
+                    op_fail_detail(&g_delete_outcome, doc.root, tr("Аккаунт не удалён"));
+                    mapped = true;
+                }
+            }
+            if (!mapped)
+                op_fail(&g_delete_outcome, tr("Аккаунт не удалён"));
+            doc.free_doc();
+
+            record_api_error(tr("Удаление аккаунта"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_fetch_avatars(void* user)
+    {
+        (void)user;
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", "/users/@me/avatars", 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            g_avatar_count = 0;
+            g_avatars_failed = false;
+
+            bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                          doc.root && doc.root->type == JTYPE_OBJ;
+            const jval* list = parsed ? doc.root->arr("avatars") : 0;
+            if (parsed && list && list->type == JTYPE_ARR)
+            {
+                for (unsigned int i = 0; i < list->count && g_avatar_count < 24; i++)
+                {
+                    const jval* a = list->at(i);
+                    avatar_entry* e = &g_avatar_list[g_avatar_count];
+
+                    const char* id = a->str("id", 0);
+                    const char* hash = a->str("storage_hash", 0);
+                    const char* desc = a->str("description", 0);
+                    if (!id || !id[0] || !hash || !hash[0]) continue;
+
+                    ccstrncpy(e->id, id, sizeof(e->id) - 1);
+                    ccstrncpy(e->hash, hash, sizeof(e->hash) - 1);
+                    if (desc) ccstrncpy(e->desc, desc, sizeof(e->desc) - 1);
+                    else e->desc[0] = 0;
+                    g_avatar_count++;
+                }
+            }
+            else
+            {
+                g_avatars_failed = true;
+            }
+            doc.free_doc();
+            log_line("profile: история аватарок, %d", g_avatar_count);
+        }
+        else
+        {
+            g_avatars_failed = true;
+        }
+
+        res.free_response();
+        InterlockedExchange(&g_avatars_busy, 0);
+        store::bump_revision();
+    }
+}
+
+void api::email_send_code()
+{
+    if (offline::active())
+    {
+        op_fail(&g_email_code, tr("Нет соединения с discord.com"));
+        return;
+    }
+    jobs::post(job_email_send_code, 0);
+}
+
+bool api::take_email_code_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_email_code, ok, error, error_cap);
+}
+
+void api::email_verify_code(const char* code)
+{
+    if (offline::active())
+    {
+        op_fail(&g_email_verify, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!code || !code[0]) return;
+
+    job_email_code* j = (job_email_code*)memalloc(sizeof(job_email_code));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->code, code, sizeof(j->code) - 1);
+
+    g_email_verify.have = false;
+    jobs::post(job_email_verify_code, j);
+}
+
+bool api::take_email_verify_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_email_verify, ok, error, error_cap);
+}
+
+void api::email_apply(const char* new_email, const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_email_apply, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!new_email || !new_email[0] || !password || !password[0]) return;
+    if (!g_email_token[0])
+    {
+        op_fail(&g_email_apply, tr("Сначала подтверди код"));
+        return;
+    }
+
+    job_email_run* j = (job_email_run*)memalloc(sizeof(job_email_run));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->email, new_email, sizeof(j->email) - 1);
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_email_apply.have = false;
+    jobs::post(job_email_apply, j);
+}
+
+bool api::take_email_apply_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_email_apply, ok, error, error_cap);
+}
+
+void api::phone_send_code(const char* phone)
+{
+    if (offline::active())
+    {
+        op_fail(&g_phone_code, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!phone || !phone[0]) return;
+
+    job_phone_send_args* j = (job_phone_send_args*)memalloc(sizeof(job_phone_send_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->phone, phone, sizeof(j->phone) - 1);
+
+    // A fresh code belongs to the number in this request, so a token from an
+    // earlier verification must not survive it.
+    ccfset(g_phone_token, 0, sizeof(g_phone_token));
+
+    g_phone_code.have = false;
+    jobs::post(job_phone_send_code, j);
+}
+
+bool api::take_phone_code_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_phone_code, ok, error, error_cap);
+}
+
+void api::phone_verify_code(const char* phone, const char* code)
+{
+    if (offline::active())
+    {
+        op_fail(&g_phone_verify, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!phone || !phone[0] || !code || !code[0]) return;
+
+    job_phone_verify_args* j = (job_phone_verify_args*)memalloc(sizeof(job_phone_verify_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->phone, phone, sizeof(j->phone) - 1);
+    ccstrncpy(j->code, code, sizeof(j->code) - 1);
+
+    g_phone_verify.have = false;
+    jobs::post(job_phone_verify_code, j);
+}
+
+bool api::take_phone_verify_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_phone_verify, ok, error, error_cap);
+}
+
+void api::phone_apply(const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_phone_apply, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!password || !password[0]) return;
+    if (!g_phone_token[0])
+    {
+        op_fail(&g_phone_apply, tr("Сначала подтверди код"));
+        return;
+    }
+
+    job_phone_apply_args* j = (job_phone_apply_args*)memalloc(sizeof(job_phone_apply_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_phone_apply.have = false;
+    jobs::post(job_phone_apply_number, j);
+}
+
+bool api::take_phone_apply_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_phone_apply, ok, error, error_cap);
+}
+
+void api::fetch_avatars()
+{
+    if (offline::active()) return;
+    if (InterlockedCompareExchange(&g_avatars_busy, 1, 0) != 0) return;
+    g_avatars_failed = false;
+    jobs::post(job_fetch_avatars, 0);
+}
+
+int api::avatar_history(avatar_item* out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+    int n = g_avatar_count < cap ? g_avatar_count : cap;
+    for (int i = 0; i < n; i++)
+    {
+        ccstrncpy(out[i].id, g_avatar_list[i].id, sizeof(out[i].id) - 1);
+        ccstrncpy(out[i].hash, g_avatar_list[i].hash, sizeof(out[i].hash) - 1);
+        ccstrncpy(out[i].desc, g_avatar_list[i].desc, sizeof(out[i].desc) - 1);
+    }
+    return n;
+}
+
+bool api::avatars_loading()
+{
+    return InterlockedCompareExchange(&g_avatars_busy, 0, 0) != 0;
+}
+
+bool api::avatars_failed()
+{
+    return g_avatars_failed && g_avatar_count == 0;
+}
+
+void api::check_username(const char* name)
+{
+    if (offline::active()) return;
+    if (!name || !name[0]) return;
+
+    job_username_ask* j = (job_username_ask*)memalloc(sizeof(job_username_ask));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->username, name, sizeof(j->username) - 1);
+
+    g_username_check.have = false;
+    jobs::post(job_username_probe, j);
+}
+
+bool api::take_username_check(username_check* out)
+{
+    if (!g_username_check.have || !out) return false;
+    out->have = true;
+    out->taken = g_username_check.taken;
+    ccstrncpy(out->error, g_username_check.error, sizeof(out->error) - 1);
+    g_username_check.have = false;
+    return true;
+}
+
+void api::update_profile(const char* bio, const char* pronouns,
+                         const char* banner_datauri, bool remove_banner)
+{
+    if (offline::active())
+    {
+        op_fail(&g_profile_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!bio && !pronouns && (!banner_datauri || !banner_datauri[0]) && !remove_banner)
+        return;
+
+    job_profile_text* j = (job_profile_text*)memalloc(sizeof(job_profile_text));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    if (bio)
+    {
+        ccstrncpy(j->bio, bio, sizeof(j->bio) - 1);
+        j->has_bio = true;
+    }
+    if (pronouns)
+    {
+        ccstrncpy(j->pronouns, pronouns, sizeof(j->pronouns) - 1);
+        j->has_pronouns = true;
+    }
+    if (banner_datauri && banner_datauri[0])
+    {
+        unsigned int len = (unsigned int)ccslenf(banner_datauri);
+        j->banner = (char*)memalloc((int)len + 1);
+        if (!j->banner)
+        {
+            op_fail(&g_profile_outcome, tr("Не хватило памяти"));
+            memfree(j);
+            return;
+        }
+        ccpy(j->banner, banner_datauri, len + 1);
+    }
+    else if (remove_banner)
+    {
+        j->remove_banner = true;
+    }
+
+    g_profile_outcome.have = false;
+    jobs::post(job_profile_patch, j);
+}
+
+bool api::take_profile_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_profile_outcome, ok, error, error_cap);
+}
+
+void api::update_account_display(const char* global_name, const char* avatar_datauri,
+                                 const char* avatar_id)
+{
+    if (offline::active())
+    {
+        op_fail(&g_account_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if ((!global_name || !global_name[0]) && (!avatar_datauri || !avatar_datauri[0]) &&
+        (!avatar_id || !avatar_id[0])) return;
+    if (avatar_datauri && avatar_datauri[0] && avatar_id && avatar_id[0]) return;
+
+    job_account_display* j = (job_account_display*)memalloc(sizeof(job_account_display));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    if (global_name && global_name[0])
+    {
+        ccstrncpy(j->name, global_name, sizeof(j->name) - 1);
+        j->has_name = true;
+    }
+    if (avatar_datauri && avatar_datauri[0])
+    {
+        unsigned int len = (unsigned int)ccslenf(avatar_datauri);
+        j->avatar_data = (char*)memalloc((int)len + 1);
+        if (!j->avatar_data)
+        {
+            op_fail(&g_account_outcome, tr("Не хватило памяти"));
+            memfree(j);
+            return;
+        }
+        ccpy(j->avatar_data, avatar_datauri, len + 1);
+    }
+    else if (avatar_id && avatar_id[0])
+    {
+        ccstrncpy(j->avatar_id, avatar_id, sizeof(j->avatar_id) - 1);
+    }
+
+    g_account_outcome.have = false;
+    jobs::post(job_update_account_display, j);
+}
+
+void api::update_account_username(const char* username, const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_account_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!username || !username[0] || !password || !password[0]) return;
+
+    job_username_new* j = (job_username_new*)memalloc(sizeof(job_username_new));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->username, username, sizeof(j->username) - 1);
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_account_outcome.have = false;
+    jobs::post(job_username_set, j);
+}
+
+bool api::take_account_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_account_outcome, ok, error, error_cap);
+}
+
+void api::delete_account(const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_delete_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!password || !password[0]) return;
+
+    job_delete_args* j = (job_delete_args*)memalloc(sizeof(job_delete_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_delete_outcome.have = false;
+    jobs::post(job_delete_account, j);
+}
+
+bool api::take_delete_account_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_delete_outcome, ok, error, error_cap);
+}
+void api::group_add_members(snowflake channel_id, const snowflake* user_ids, int count)
+{
+    if (!channel_id || !user_ids || count <= 0) return;
+    if (count > 10) count = 10;
+
+    group_add_args* j = (group_add_args*)memalloc(sizeof(group_add_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel = channel_id;
+    for (int i = 0; i < count; i++) j->members[i] = user_ids[i];
+    j->count = count;
+
+    jobs::post(job_group_add, j);
+}
+
+void api::group_create(const snowflake* user_ids, int count)
+{
+    if (!user_ids || count <= 0) return;
+    if (count > 10) count = 10;
+
+    group_add_args* j = (group_add_args*)memalloc(sizeof(group_add_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    for (int i = 0; i < count; i++) j->members[i] = user_ids[i];
+    j->count = count;
+
+    jobs::post(job_group_create, j);
+}
+
+void api::group_remove_member(snowflake channel_id, snowflake user_id)
+{
+    job_ids* j = make_ids(channel_id, user_id);
+    if (j) jobs::post(job_group_remove, j);
+}
+
+void api::close_conversation(snowflake channel_id)
+{
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_group_leave, j);
+}
+
+void api::group_transfer_owner(snowflake channel_id, snowflake user_id)
+{
+    job_ids* j = make_ids(channel_id, user_id);
+    if (j) jobs::post(job_group_transfer, j);
+}
+
+bool api::take_created_channel(snowflake* out)
+{
+    if (!g_group_lock_ready || !out) return false;
+
+    EnterCriticalSection(&g_group_lock);
+    bool got = g_group_result != 0;
+    if (got)
+    {
+        *out = g_group_result;
+        g_group_result = 0;
+    }
+    LeaveCriticalSection(&g_group_lock);
+    return got;
+}
+
+void api::fetch_pins(snowflake channel_id)
+{
+    if (!channel_id) return;
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_fetch_pins, j);
+}
+
+void api::fetch_forum_posts(snowflake forum_id)
+{
+    if (!forum_id || offline::active()) return;
+
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(forum_id);
+        if (!ch || ch->history_loading) return;
+        ch->history_loading = true;
+    }
+
+    job_forum_list* j = (job_forum_list*)memalloc(sizeof(job_forum_list));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    j->forum = forum_id;
+
+    const ulist<snowflake>* have = store::forum_posts(forum_id);
+    j->offset = have ? (int)have->count : 0;
+
+    jobs::post(job_fetch_forum_list, j);
+}
+
+void api::create_forum_post(snowflake forum_id, const char* name, const char* content,
+                           const snowflake* tags, int tag_count)
+{
+    if (!forum_id || !name || !name[0] || offline::active()) return;
+    if (g_forum_post_busy) return;
+
+    {
+        store::guard g;
+        if (!store::find_channel(forum_id)) return;
+    }
+
+    job_forum_post* j = (job_forum_post*)memalloc(sizeof(job_forum_post));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    j->forum = forum_id;
+    ccstrncpy(j->name, name, sizeof(j->name) - 1);
+    if (content) ccstrncpy(j->content, content, sizeof(j->content) - 1);
+    if (tags && tag_count > 0)
+    {
+        if (tag_count > 12) tag_count = 12;
+        for (int i = 0; i < tag_count; i++) j->tags[i] = tags[i];
+        j->tag_count = tag_count;
+    }
+
+    g_forum_post_have = false;
+    g_forum_post_busy = forum_id;
+    jobs::post(job_create_forum_post, j);
+}
+
+bool api::forum_post_busy(snowflake forum_id)
+{
+    return forum_id && g_forum_post_busy == forum_id;
+}
+
+bool api::take_forum_post_result(snowflake forum_id, bool* ok, snowflake* thread_id,
+                                char* error, int error_cap)
+{
+    if (!g_forum_post_have || g_forum_post_forum != forum_id) return false;
+
+    if (ok) *ok = g_forum_post_ok;
+    if (thread_id) *thread_id = g_forum_post_thread;
+    if (error && error_cap > 0)
+    {
+        if (g_forum_post_ok) error[0] = 0;
+        else ccstrncpy(error, g_forum_post_error, error_cap - 1);
+    }
+
+    g_forum_post_have = false;
+    return true;
+}
+
+void api::join_thread(snowflake thread_id)
+{
+    if (!thread_id || offline::active()) return;
+    job_ids* j = make_ids(thread_id, 0);
+    if (j) jobs::post(job_join_thread, j);
+}
+
+void api::pin_message(snowflake channel_id, snowflake message_id)
+{
+    if (!channel_id || !message_id) return;
+    job_ids* j = make_ids(channel_id, message_id);
+    if (j) jobs::post(job_pin_add, j);
+}
+
+void api::unpin_message(snowflake channel_id, snowflake message_id)
+{
+    if (!channel_id || !message_id) return;
+    job_ids* j = make_ids(channel_id, message_id);
+    if (j) jobs::post(job_pin_remove, j);
+}
+
+void api::remove_relationship(snowflake user_id)
+{
+    job_ids* j = make_ids(user_id, 0);
+    if (j) jobs::post(job_delete_relationship, j);
+}
+
+void api::block_user(snowflake user_id)
+{
+    job_ids* j = make_ids(user_id, 0);
+    if (j) jobs::post(job_block_user, j);
+}
+
+namespace
+{
+    job_card* make_card_job(const char* code, snowflake message_id, snowflake channel_id,
+                            int channel_type, snowflake location_guild)
+    {
+        if (!code || !code[0]) return 0;
+
+        job_card* j = (job_card*)memalloc(sizeof(job_card));
+        if (!j) return 0;
+
+        ccfset(j, 0, sizeof(*j));
+        ccstrncpy(j->code, code, sizeof(j->code) - 1);
+        j->message_id = message_id;
+        j->channel_id = channel_id;
+        j->channel_type = channel_type;
+        j->location_guild = location_guild;
+        return j;
+    }
+}
+
+void api::resolve_invite(const char* code, snowflake message_id,
+                         snowflake channel_id, int channel_type, snowflake location_guild)
+{
+    if (!code || !code[0]) return;
+
+    // Once per code. The panel asks on every frame it is drawn, and a request
+    // per frame is how a chat full of links becomes a rate limit.
+    EnterCriticalSection(&g_err_lock);
+    bool known = find_card(code) != 0;
+    if (!known)
+    {
+        api::invite_card pending;
+        ccfset(&pending, 0, sizeof(pending));
+        ccstrncpy(pending.code, code, sizeof(pending.code) - 1);
+        g_cards.push(pending);
+    }
+    LeaveCriticalSection(&g_err_lock);
+
+    if (known) return;
+
+    job_card* j = make_card_job(code, message_id, channel_id, channel_type, location_guild);
+    if (j) jobs::post(job_resolve_invite, j);
+}
+
+bool api::invite_card_of(const char* code, invite_card* out)
+{
+    if (!code || !out) return false;
+
+    EnterCriticalSection(&g_err_lock);
+    api::invite_card* slot = find_card(code);
+    if (slot) *out = *slot;
+    LeaveCriticalSection(&g_err_lock);
+
+    return slot != 0;
+}
+
+void api::join_invite_from_message(const char* code, snowflake message_id,
+                                   snowflake channel_id, int channel_type,
+                                   snowflake location_guild)
+{
+    job_card* j = make_card_job(code, message_id, channel_id, channel_type, location_guild);
+    if (j) jobs::post(job_join_from_message, j);
+}
+
+void api::join_guild_by_invite(const char* invite_code)
+{
+    // Accept a full url as well as a bare code. Both are kept: the code is
+    // what the request is made with, the whole of it is what gets reported.
+    const char* code = invite_code;
+    for (const char* p = invite_code; *p; p++)
+        if (*p == '/') code = p + 1;
+
+    job_name* j = make_name(code);
+    if (!j) return;
+
+    ccstrncpy(j->full, invite_code, sizeof(j->full) - 1);
+    jobs::post(job_join_guild, j);
+}
+
+void api::fetch_audit_log(snowflake guild_id)
+{
+    if (InterlockedCompareExchange(&g_audit_busy, 1, 0) != 0) return;
+
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_fetch_audit, j);
+    else InterlockedExchange(&g_audit_busy, 0);
+}
+
+int api::audit_log(audit_row* out, int cap)
+{
+    if (!g_ready || !out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int total = (int)g_audit.count;
+    int copied = total < cap ? total : cap;
+    for (int i = 0; i < copied; i++) out[i] = g_audit[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return copied;
+}
+
+bool api::audit_loading() { return g_audit_busy != 0; }
+bool api::audit_forbidden() { return g_audit_denied != 0; }
+
+void api::fetch_bans(snowflake guild_id)
+{
+    if (InterlockedCompareExchange(&g_bans_busy, 1, 0) != 0) return;
+
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_fetch_bans, j);
+    else InterlockedExchange(&g_bans_busy, 0);
+}
+
+int api::bans(ban_row* out, int cap)
+{
+    if (!g_ready || !out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int total = (int)g_bans.count;
+    int copied = total < cap ? total : cap;
+    for (int i = 0; i < copied; i++) out[i] = g_bans[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return copied;
+}
+
+bool api::bans_loading() { return g_bans_busy != 0; }
+bool api::bans_forbidden() { return g_bans_denied != 0; }
+
+void api::request_ownership_code(snowflake guild_id)
+{
+    job_transfer* j = make_transfer(guild_id, 0, 0);
+    if (j) jobs::post(job_ownership_code, j);
+}
+
+void api::transfer_ownership(snowflake guild_id, snowflake user_id, const char* code)
+{
+    job_transfer* j = make_transfer(guild_id, user_id, code);
+    if (j) jobs::post(job_transfer_ownership, j);
+}
+
+bool api::ownership_code_sent() { return g_ownership_code_sent != 0; }
+
+unsigned long long api::ownership_code_age_ms()
+{
+    unsigned long long at = g_ownership_code_at;
+    if (!at) return 0;
+
+    unsigned long long now = unix_now_ms();
+    return now > at ? now - at : 0;
+}
+void api::clear_ownership_state()
+{
+    g_ownership_code_at = 0;
+    InterlockedExchange(&g_ownership_code_sent, 0);
+}
+
+void api::kick_member(snowflake guild_id, snowflake user_id)
+{
+    job_ids* j = make_ids(guild_id, user_id);
+    if (j) jobs::post(job_kick, j);
+}
+
+void api::unban(snowflake guild_id, snowflake user_id)
+{
+    job_ids* j = make_ids(guild_id, user_id);
+    if (j) jobs::post(job_unban, j);
+}
+
+void api::voice_kick(snowflake guild_id, snowflake user_id)
+{
+    job_moderate* j = make_moderate_job(guild_id, user_id);
+    if (!j) return;
+
+    ccstrncpy(j->field, "channel_id", sizeof(j->field) - 1);
+    ccstrncpy(j->value, "null", sizeof(j->value) - 1);
+    jobs::post(job_patch_member, j);
+}
+
+void api::voice_move(snowflake guild_id, snowflake user_id, snowflake channel_id)
+{
+    if (!channel_id) { api::voice_kick(guild_id, user_id); return; }
+
+    job_moderate* j = make_moderate_job(guild_id, user_id);
+    if (!j) return;
+
+    ccstrncpy(j->field, "channel_id", sizeof(j->field) - 1);
+    cnprint(j->value, sizeof(j->value), "\"%llu\"", channel_id);
+    jobs::post(job_patch_member, j);
+}
+
+void api::set_server_mute(snowflake guild_id, snowflake user_id, bool muted)
+{
+    job_moderate* j = make_moderate_job(guild_id, user_id);
+    if (!j) return;
+
+    ccstrncpy(j->field, "mute", sizeof(j->field) - 1);
+    ccstrncpy(j->value, muted ? "true" : "false", sizeof(j->value) - 1);
+    jobs::post(job_patch_member, j);
+}
+
+void api::timeout_member(snowflake guild_id, snowflake user_id, int minutes)
+{
+    job_moderate* j = make_moderate_job(guild_id, user_id);
+    if (!j) return;
+
+    ccstrncpy(j->field, "communication_disabled_until", sizeof(j->field) - 1);
+
+    if (minutes <= 0)
+    {
+        // Null lifts it. Sending a stamp in the past does not: discord keeps
+        // the later of the two.
+        ccstrncpy(j->value, "null", sizeof(j->value) - 1);
+    }
+    else
+    {
+        unsigned long long until_ms = unix_now_ms() + (unsigned long long)minutes * 60000ULL;
+
+        char iso[48];
+        unix_ms_to_iso(until_ms, iso, sizeof(iso));
+        cnprint(j->value, sizeof(j->value), "\"%s\"", iso);
+    }
+
+    jobs::post(job_patch_member, j);
+}
+
+void api::ban_member(snowflake guild_id, snowflake user_id, int delete_message_seconds)
+{
+    job_moderate* j = make_moderate_job(guild_id, user_id);
+    if (!j) return;
+
+    j->number = delete_message_seconds;
+    jobs::post(job_ban_member, j);
+}
+
+const char* api::audit_action_name(int action, char* scratch, int cap)
+{
+    switch (action)
+    {
+    case 1:  return tr("сервер изменён");
+    case 10: return tr("канал создан");
+    case 11: return tr("канал изменён");
+    case 12: return tr("канал удалён");
+    case 13: return tr("права канала выданы");
+    case 14: return tr("права канала изменены");
+    case 15: return tr("права канала сняты");
+    case 20: return tr("участник выгнан");
+    case 21: return tr("чистка участников");
+    case 22: return tr("участник забанен");
+    case 23: return tr("участник разбанен");
+    case 24: return tr("участник изменён");
+    case 25: return tr("роли участника изменены");
+    case 26: return tr("участник перемещён");
+    case 27: return tr("участник отключён");
+    case 28: return tr("бот добавлен");
+    case 30: return tr("роль создана");
+    case 31: return tr("роль изменена");
+    case 32: return tr("роль удалена");
+    case 40: return tr("приглашение создано");
+    case 41: return tr("приглашение изменено");
+    case 42: return tr("приглашение отозвано");
+    case 50: return tr("вебхук создан");
+    case 51: return tr("вебхук изменён");
+    case 52: return tr("вебхук удалён");
+    case 60: return tr("эмодзи добавлено");
+    case 61: return tr("эмодзи изменено");
+    case 62: return tr("эмодзи удалено");
+    case 72: return tr("сообщение удалено");
+    case 73: return tr("сообщения вычищены");
+    case 74: return tr("сообщение закреплено");
+    case 75: return tr("сообщение откреплено");
+    case 80: return tr("интеграция добавлена");
+    case 81: return tr("интеграция изменена");
+    case 82: return tr("интеграция удалена");
+    case 83: return tr("событие создано");
+    case 84: return tr("событие изменено");
+    case 85: return tr("событие удалено");
+    case 90: return tr("ветка создана");
+    case 91: return tr("ветка изменена");
+    case 92: return tr("ветка удалена");
+    default:
+        // Discord adds numbers faster than anybody can name them, and a row
+        // that says who and when is still worth showing.
+        cnprint(scratch, cap, tr("действие %d"), action);
+        return scratch;
+    }
+}
+
+void api::fetch_invites(snowflake guild_id)
+{
+    if (InterlockedCompareExchange(&g_invites_busy, 1, 0) != 0) return;
+
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_fetch_invites, j);
+    else InterlockedExchange(&g_invites_busy, 0);
+}
+
+void api::revoke_invite(const char* code, snowflake guild_id)
+{
+    if (!code || !code[0]) return;
+
+    job_code* j = (job_code*)memalloc(sizeof(job_code));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+    ccstrncpy(j->code, code, sizeof(j->code) - 1);
+
+    jobs::post(job_revoke_invite, j);
+}
+
+int api::invites(invite_row* out, int cap)
+{
+    if (!g_ready || !out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int total = (int)g_invites.count;
+    int copied = total < cap ? total : cap;
+    for (int i = 0; i < copied; i++) out[i] = g_invites[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return copied;
+}
+
+bool api::invites_loading() { return g_invites_busy != 0; }
+bool api::invites_forbidden() { return g_invites_denied != 0; }
+
+void api::fetch_onboarding(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (!j) return;
+
+    InterlockedIncrement(&g_onboard_busy);
+    jobs::post(job_fetch_onboarding, j);
+}
+
+void api::probe_onboarding(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 1);
+    if (!j) return;
+
+    InterlockedIncrement(&g_onboard_busy);
+    jobs::post(job_fetch_onboarding, j);
+}
+
+snowflake api::take_onboarding_prompt()
+{
+    return (snowflake)InterlockedExchange64((volatile long long*)&g_onboard_show, 0);
+}
+
+bool api::onboarding_answered() { return g_onboard_answered; }
+
+void api::fetch_rules(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (!j) return;
+
+    EnterCriticalSection(&g_err_lock);
+    free_rules();
+    g_rules_raw_ready = false;
+    LeaveCriticalSection(&g_err_lock);
+
+    InterlockedIncrement(&g_onboard_busy);
+    jobs::post(job_fetch_rules, j);
+}
+
+// Read once and cleared, because the thing it triggers must happen once.
+snowflake api::take_joined_guild()
+{
+    return (snowflake)InterlockedExchange64((volatile long long*)&g_joined_guild, 0);
+}
+
+bool api::onboarding_loading() { return g_onboard_busy != 0; }
+bool api::onboarding_ready() { return g_prompts.count > 0; }
+bool api::rules_ready() { return g_rules.count > 0; }
+
+int api::onboarding_prompts(onboard_prompt* out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int n = (int)g_prompts.count < cap ? (int)g_prompts.count : cap;
+    for (int i = 0; i < n; i++) out[i] = g_prompts[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return n;
+}
+
+int api::onboarding_options(onboard_option* out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int n = (int)g_options.count < cap ? (int)g_options.count : cap;
+    for (int i = 0; i < n; i++) out[i] = g_options[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return n;
+}
+
+int api::rules_count() { return (int)g_rules.count; }
+
+void api::rules_line(int index, char* out, int cap)
+{
+    if (!out || cap <= 0) return;
+    out[0] = 0;
+
+    EnterCriticalSection(&g_err_lock);
+    if (index >= 0 && index < (int)g_rules.count && g_rules[(unsigned int)index])
+        ccstrncpy(out, g_rules[(unsigned int)index], (size_t)cap - 1);
+    LeaveCriticalSection(&g_err_lock);
+}
+
+void api::rules_description(char* out, int cap)
+{
+    if (!out || cap <= 0) return;
+
+    EnterCriticalSection(&g_err_lock);
+    ccstrncpy(out, g_rules_desc, (size_t)cap - 1);
+    out[cap - 1] = 0;
+    LeaveCriticalSection(&g_err_lock);
+}
+
+void api::submit_onboarding(snowflake guild_id, const snowflake* chosen, int count)
+{
+    job_onboard_submit* j = (job_onboard_submit*)memalloc(sizeof(job_onboard_submit));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+
+    for (int i = 0; i < count && j->count < 64; i++) j->chosen[j->count++] = chosen[i];
+
+    jobs::post(job_submit_onboarding, j);
+}
+
+void api::accept_rules(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_accept_rules, j);
+}
+
+void api::fetch_webhooks(snowflake guild_id)
+{
+    if (InterlockedCompareExchange(&g_webhooks_busy, 1, 0) != 0) return;
+
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_fetch_webhooks, j);
+    else InterlockedExchange(&g_webhooks_busy, 0);
+}
+
+void api::send_via_webhook(snowflake webhook_id, const char* token, const char* content,
+                           const char* username, const char* avatar_url)
+{
+    if (!webhook_id || !token || !token[0] || !content || !content[0]) return;
+
+    hook_post* j = (hook_post*)memalloc(sizeof(hook_post));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->id = webhook_id;
+    ccstrncpy(j->token, token, sizeof(j->token) - 1);
+    ccstrncpy(j->content, content, sizeof(j->content) - 1);
+    if (username) ccstrncpy(j->username, username, sizeof(j->username) - 1);
+    if (avatar_url) ccstrncpy(j->avatar, avatar_url, sizeof(j->avatar) - 1);
+
+    jobs::post(job_webhook_post, j);
+}
+
+void api::delete_webhook(snowflake webhook_id, snowflake guild_id)
+{
+    job_ids* j = make_ids(webhook_id, guild_id);
+    if (j) jobs::post(job_delete_webhook, j);
+}
+
+int api::webhooks(webhook_row* out, int cap)
+{
+    if (!g_ready || !out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int total = (int)g_webhooks.count;
+    int copied = total < cap ? total : cap;
+    for (int i = 0; i < copied; i++) out[i] = g_webhooks[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return copied;
+}
+
+bool api::webhooks_loading() { return g_webhooks_busy != 0; }
+
+void api::create_channel(snowflake guild_id, const char* name, int type, snowflake parent_id)
+{
+    if (!name || !name[0]) return;
+
+    job_channel* j = (job_channel*)memalloc(sizeof(job_channel));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+    j->parent_id = parent_id;
+    j->type = type;
+    ccstrncpy(j->name, name, sizeof(j->name) - 1);
+
+    jobs::post(job_create_channel, j);
+}
+
+void api::reorder_channels(snowflake guild_id, const snowflake* ordered, int count,
+                           snowflake reparented, snowflake parent_id)
+{
+    if (!ordered || count <= 0) return;
+    if (count > 256) count = 256;
+
+    job_order* j = (job_order*)memalloc(sizeof(job_order));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+    j->reparented = reparented;
+    j->parent_id = parent_id;
+    j->count = count;
+    for (int i = 0; i < count; i++) j->ids[i] = ordered[i];
+
+    jobs::post(job_reorder_channels, j);
+}
+
+void api::update_guild_name(snowflake guild_id, const char* name)
+{
+    if (!name || !name[0]) return;
+
+    job_name_id* j = (job_name_id*)memalloc(sizeof(job_name_id));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->id = guild_id;
+    ccstrncpy(j->text, name, sizeof(j->text) - 1);
+
+    jobs::post(job_guild_name, j);
+}
+
+void api::rename_channel(snowflake channel_id, const char* name)
+{
+    if (!name || !name[0]) return;
+
+    job_name_id* j = (job_name_id*)memalloc(sizeof(job_name_id));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->id = channel_id;
+    ccstrncpy(j->text, name, sizeof(j->text) - 1);
+
+    jobs::post(job_channel_name, j);
+}
+
+void api::set_channel_slowmode(snowflake channel_id, int seconds)
+{
+    if (seconds < 0) seconds = 0;
+
+    job_slowmode* j = (job_slowmode*)memalloc(sizeof(job_slowmode));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel_id = channel_id;
+    j->seconds = seconds;
+
+    jobs::post(job_channel_slowmode, j);
+}
+
+void api::update_guild_icon(snowflake guild_id, const wchar_t* path)
+{
+    job_guild_image* j = (job_guild_image*)memalloc(sizeof(job_guild_image));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+
+    if (path)
+    {
+        int i = 0;
+        while (path[i] && i < MAX_PATH - 1) { j->path[i] = path[i]; i++; }
+        j->path[i] = 0;
+    }
+
+    jobs::post(job_guild_icon, j);
+}
+
+void api::create_guild(const char* name)
+{
+    job_name* j = make_name(name);
+    if (j) jobs::post(job_create_guild, j);
+}
+
+void api::delete_channel(snowflake channel_id)
+{
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_delete_channel, j);
+}
+
+namespace
+{
+    job_overwrite* make_overwrite(snowflake channel_id, snowflake target_id)
+    {
+        job_overwrite* j = (job_overwrite*)memalloc(sizeof(job_overwrite));
+        if (j)
+        {
+            ccfset(j, 0, sizeof(*j));
+            j->channel_id = channel_id;
+            j->target_id = target_id;
+        }
+        return j;
+    }
+}
+
+void api::set_channel_overwrite(snowflake channel_id, snowflake target_id, bool is_role,
+                                unsigned long long allow, unsigned long long deny)
+{
+    job_overwrite* j = make_overwrite(channel_id, target_id);
+    if (!j) return;
+
+    j->is_role = is_role;
+    j->allow = allow;
+    j->deny = deny;
+
+    jobs::post(job_channel_overwrite, j);
+}
+
+void api::clear_channel_overwrite(snowflake channel_id, snowflake target_id)
+{
+    job_overwrite* j = make_overwrite(channel_id, target_id);
+    if (!j) return;
+
+    j->clearing = true;
+    jobs::post(job_channel_overwrite, j);
+}
+
+void api::send_guild_invite(snowflake from_channel, snowflake to_channel)
+{
+    if (!from_channel || !to_channel) return;
+
+    job_two_ids* j = (job_two_ids*)memalloc(sizeof(job_two_ids));
+    if (!j) return;
+
+    j->from_channel = from_channel;
+    j->to_channel = to_channel;
+    jobs::post(job_send_invite, j);
+}
+
+void api::create_invite(snowflake channel_id, int max_age, int max_uses, bool temporary)
+{
+    job_link* j = (job_link*)memalloc(sizeof(job_link));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel_id = channel_id;
+    j->max_age = max_age;
+    j->max_uses = max_uses;
+    j->temporary = temporary;
+
+    jobs::post(job_create_invite, j);
+}
+
+void api::create_webhook(snowflake channel_id, const char* name)
+{
+    job_link* j = (job_link*)memalloc(sizeof(job_link));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel_id = channel_id;
+    if (name) ccstrncpy(j->name, name, sizeof(j->name) - 1);
+
+    jobs::post(job_create_webhook, j);
+}
+
+void api::add_member_role(snowflake guild_id, snowflake user_id, snowflake role_id)
+{
+    job_role* j = make_role_job(guild_id);
+    if (!j) return;
+    j->user_id = user_id;
+    j->role_id = role_id;
+    jobs::post(job_add_member_role, j);
+}
+
+void api::remove_member_role(snowflake guild_id, snowflake user_id, snowflake role_id)
+{
+    job_role* j = make_role_job(guild_id);
+    if (!j) return;
+    j->user_id = user_id;
+    j->role_id = role_id;
+    jobs::post(job_remove_member_role, j);
+}
+
+void api::create_role(snowflake guild_id, const char* name)
+{
+    job_role* j = make_role_job(guild_id);
+    if (!j) return;
+    if (name) ccstrncpy(j->name, name, sizeof(j->name) - 1);
+    jobs::post(job_create_role, j);
+}
+
+void api::delete_role(snowflake guild_id, snowflake role_id)
+{
+    job_role* j = make_role_job(guild_id);
+    if (!j) return;
+    j->role_id = role_id;
+    jobs::post(job_delete_role, j);
+}
+
+void api::edit_role(snowflake guild_id, snowflake role_id, const char* name,
+                    unsigned long long permissions, unsigned int color,
+                    bool hoist, bool mentionable)
+{
+    job_role* j = make_role_job(guild_id);
+    if (!j) return;
+
+    j->role_id = role_id;
+    j->permissions = permissions;
+    j->color = color;
+    j->hoist = hoist;
+    j->mentionable = mentionable;
+    if (name) ccstrncpy(j->name, name, sizeof(j->name) - 1);
+
+    jobs::post(job_edit_role, j);
+}
+
+void api::delete_guild(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_delete_guild, j);
+}
+
+void api::leave_guild(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_leave_guild, j);
+}
